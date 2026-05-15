@@ -1,0 +1,450 @@
+"""
+CNN PumpDetector v3 training script — dual-stream (coin + market context).
+
+Architecture: PumpDetectorV3
+  - Separate 3-block 1D-CNN towers for coin L2 and market context (BTC)
+  - Towers concatenated → shared MLP classifier → sigmoid pump probability
+  - Captures the full 3×3 coin×market regime matrix
+
+Input per sample:
+  x_coin   [96, 6]  — bid_price, ask_price, bid_size, ask_size, buy_ratio, aggressor_imbalance
+  x_market [96, 6]  — same 6 features for BTC/market context
+                       (neutral fill if no _market_ctx.csv found)
+
+9-cell sample weights (coin_regime × market_regime):
+  Coin:pump   + Market:normal    → 3.0   most suspicious — highest training signal
+  Coin:pump   + Market:uncertain → 2.0   ambiguous
+  Coin:pump   + Market:pumped    → 1.0   least suspicious
+  Coin:control + Market:normal   → 2.5   hard negative
+  Coin:control + Market:uncertain→ 1.5
+  Coin:control + Market:pumped   → 1.0   easy negative
+
+Usage (from project root):
+    python scripts/train_pump_detector.py
+"""
+
+import os
+import sys
+import re
+import json
+import glob
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from sklearn.metrics import roc_auc_score, classification_report
+
+from models.pump_detector import PumpDetectorV3
+
+# ── Configuration ─────────────────────────────────────────────────────────────
+
+RECONSTRUCTED_BASE = "reconstructed"
+SYNTHETIC_BASE     = "synthetic"
+MODEL_SAVE_PATH    = "models/pump_detector_v3.pth"
+TIMESTEPS          = 96
+
+L2_FEATURES    = ['bid_price', 'ask_price', 'bid_size', 'ask_size']
+TRADE_FEATURES = ['buy_ratio', 'aggressor_imbalance']
+ALL_FEATURES   = L2_FEATURES + TRADE_FEATURES
+NUM_FEATURES   = len(ALL_FEATURES)   # 6
+
+TRAIN_EXCHANGES = ['binance', 'kucoin', 'huobi', 'mexc', 'gateio', 'bitget']
+TEST_EXCHANGES  = ['bybit', 'okx']
+
+EPOCHS     = 60
+BATCH_SIZE = 64
+LR         = 1e-3
+DEVICE     = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+NEUTRAL_BUY_RATIO = 0.5
+NEUTRAL_AGGRESSOR = 0.0
+
+# 9-cell weight matrix (coin_regime × market_regime)
+CELL_WEIGHTS = {
+    ("pump",    "normal"):    3.0,
+    ("pump",    "uncertain"): 2.0,
+    ("pump",    "pumped"):    1.0,
+    ("control", "normal"):    2.5,
+    ("control", "uncertain"): 1.5,
+    ("control", "pumped"):    1.0,
+}
+
+
+# ── Trade-flow loader ─────────────────────────────────────────────────────────
+
+def load_trade_features(trades_path: str, n_timesteps: int) -> np.ndarray:
+    out = np.full((n_timesteps, 2),
+                  [NEUTRAL_BUY_RATIO, NEUTRAL_AGGRESSOR], dtype=np.float32)
+    try:
+        df = pd.read_csv(trades_path)
+        if not {"timestamp_idx", "side", "size"}.issubset(df.columns):
+            return out
+        df["size"] = pd.to_numeric(df["size"], errors="coerce").fillna(0)
+        for idx, grp in df.groupby("timestamp_idx"):
+            if not (0 <= idx < n_timesteps):
+                continue
+            total   = grp["size"].sum()
+            if total <= 0:
+                continue
+            buy_vol = grp.loc[grp["side"] == "buy", "size"].sum()
+            sell_vol = total - buy_vol
+            out[int(idx), 0] = buy_vol / total
+            out[int(idx), 1] = (buy_vol - sell_vol) / total
+    except Exception:
+        pass
+    return out
+
+
+# ── Normalisation ─────────────────────────────────────────────────────────────
+
+def normalize_window(window: np.ndarray) -> np.ndarray:
+    """Prices ÷ first mid-price, sizes ÷ mean size, trade features unchanged."""
+    w = window.copy().astype(np.float32)
+    mid0 = (w[0, 0] + w[0, 1]) / 2.0
+    if mid0 > 0:
+        w[:, 0:2] /= mid0
+    mean_sz = w[:, 2:4].mean()
+    if mean_sz > 0:
+        w[:, 2:4] /= mean_sz
+    return w
+
+
+# ── Market context loader ─────────────────────────────────────────────────────
+
+NEUTRAL_MARKET = None   # built lazily on first use
+
+def neutral_market() -> np.ndarray:
+    global NEUTRAL_MARKET
+    if NEUTRAL_MARKET is None:
+        NEUTRAL_MARKET = np.column_stack([
+            np.ones(TIMESTEPS),             # bid_price (flat)
+            np.ones(TIMESTEPS),             # ask_price (flat)
+            np.ones(TIMESTEPS),             # bid_size
+            np.ones(TIMESTEPS),             # ask_size
+            np.full(TIMESTEPS, 0.5),        # buy_ratio (neutral)
+            np.zeros(TIMESTEPS),            # aggressor_imbalance (neutral)
+        ]).astype(np.float32)
+    return NEUTRAL_MARKET.copy()
+
+
+def load_market_ctx(l2_path: str) -> np.ndarray:
+    ctx_path = re.sub(r'(_direct_L2|_synthetic_L2|_L2)\.csv$',
+                      '_market_ctx.csv', l2_path)
+    if not os.path.exists(ctx_path):
+        return neutral_market()
+    try:
+        df = pd.read_csv(ctx_path)
+        needed = ['bid_price', 'ask_price', 'bid_size', 'ask_size']
+        if not set(needed).issubset(df.columns):
+            return neutral_market()
+        data = df[needed].values[:TIMESTEPS].astype(np.float32)
+        if len(data) < TIMESTEPS:
+            return neutral_market()
+        if 'buy_ratio' in df.columns and 'aggressor_imbalance' in df.columns:
+            tf = df[['buy_ratio', 'aggressor_imbalance']].values[:TIMESTEPS].astype(np.float32)
+        else:
+            tf = np.column_stack([np.full(TIMESTEPS, 0.5),
+                                  np.zeros(TIMESTEPS)]).astype(np.float32)
+        return np.concatenate([data, tf], axis=1)  # [96, 6]
+    except Exception:
+        return neutral_market()
+
+
+# ── Meta / cell weight ────────────────────────────────────────────────────────
+
+def load_cell_weight(l2_path: str, label: int) -> float:
+    meta_path = re.sub(r'(_direct_L2|_synthetic_L2|_L2)\.csv$',
+                       '_meta.json', l2_path)
+    coin_regime   = "pump" if label == 1 else "control"
+    market_regime = "normal"
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path) as f:
+                meta = json.load(f)
+            coin_regime   = meta.get("coin_regime",   coin_regime)
+            market_regime = meta.get("market_regime", "normal")
+            if market_regime == "unknown":
+                market_regime = "normal"
+        except Exception:
+            pass
+    return CELL_WEIGHTS.get((coin_regime, market_regime), 1.5)
+
+
+# ── Window extraction ─────────────────────────────────────────────────────────
+
+def extract_windows(l2_df: pd.DataFrame, l2_path: str,
+                    label: int, step_ratio: float = 0.5):
+    """
+    Returns lists of (coin_window, market_window, cell_weight) tuples.
+    Each window is [TIMESTEPS, 6] float32, already normalised.
+    """
+    l2_data = l2_df[L2_FEATURES].values.astype(np.float32)
+    n_rows  = len(l2_data)
+
+    tp = l2_path.replace("_L2.csv", "_trades.csv")
+    tp = tp.replace("_direct_L2.csv", "_trades.csv")
+    tp = tp.replace("_synthetic_L2.csv", "_trades.csv")
+    trade_data = (load_trade_features(tp, n_rows)
+                  if os.path.exists(tp)
+                  else np.full((n_rows, 2),
+                               [NEUTRAL_BUY_RATIO, NEUTRAL_AGGRESSOR],
+                               dtype=np.float32))
+
+    coin_full   = np.concatenate([l2_data, trade_data], axis=1)  # [N, 6]
+    market_full = load_market_ctx(l2_path)                        # [96, 6]
+    cell_weight = load_cell_weight(l2_path, label)
+
+    step = max(1, int(TIMESTEPS * step_ratio))
+    coin_windows, market_windows, weights = [], [], []
+
+    for start in range(0, n_rows - TIMESTEPS + 1, step):
+        w_coin = coin_full[start:start + TIMESTEPS]
+        if len(w_coin) != TIMESTEPS or not np.isfinite(w_coin).all():
+            continue
+        # Market context is a fixed 96-step sequence; slide same window over it
+        # if it is longer (rare), otherwise repeat the whole sequence
+        if len(market_full) >= TIMESTEPS:
+            w_mkt = market_full[start:start + TIMESTEPS] if len(market_full) > TIMESTEPS else market_full
+        else:
+            w_mkt = market_full
+
+        coin_windows.append(normalize_window(w_coin))
+        market_windows.append(normalize_window(w_mkt))
+        weights.append(cell_weight)
+
+    return coin_windows, market_windows, weights
+
+
+# ── Dataset class ─────────────────────────────────────────────────────────────
+
+class PumpDataset(Dataset):
+    def __init__(self, X_coin, X_market, y, sample_weights):
+        self.X_coin   = torch.FloatTensor(X_coin)
+        self.X_market = torch.FloatTensor(X_market)
+        self.y        = torch.FloatTensor(y)
+        self.weights  = sample_weights  # numpy array
+
+    def __len__(self):
+        return len(self.y)
+
+    def __getitem__(self, idx):
+        return self.X_coin[idx], self.X_market[idx], self.y[idx]
+
+
+# ── Dataset loading ───────────────────────────────────────────────────────────
+
+def load_dataset(exchanges: list):
+    X_coin_all, X_mkt_all, y_all, w_all = [], [], [], []
+
+    for exchange in exchanges:
+        search_bases = [
+            os.path.join(RECONSTRUCTED_BASE, exchange),
+            os.path.join(SYNTHETIC_BASE,     exchange),
+        ]
+
+        all_regime_dirs = set()
+        for b in search_bases:
+            if os.path.exists(b):
+                all_regime_dirs.update(os.listdir(b))
+
+        if not all_regime_dirs:
+            print(f"  [SKIP] {exchange} — not found in reconstructed/ or synthetic/")
+            continue
+
+        for regime_dir in sorted(all_regime_dirs):
+            label = 1 if regime_dir == "pumps" else 0
+            csv_files = []
+            for b in search_bases:
+                rp = os.path.join(b, regime_dir)
+                if os.path.isdir(rp):
+                    csv_files.extend(glob.glob(
+                        os.path.join(rp, "**", "*_L2.csv"), recursive=True
+                    ))
+            # Exclude market context files
+            csv_files = [p for p in csv_files if "_market_ctx" not in p]
+
+            n_windows = 0
+            for fpath in csv_files:
+                try:
+                    df = pd.read_csv(fpath)
+                    missing = [c for c in L2_FEATURES if c not in df.columns]
+                    if missing or len(df) < TIMESTEPS:
+                        continue
+                    df = df.dropna(subset=L2_FEATURES)
+                    coin_w, mkt_w, wts = extract_windows(df, fpath, label)
+                    X_coin_all.extend(coin_w)
+                    X_mkt_all.extend(mkt_w)
+                    y_all.extend([label] * len(coin_w))
+                    w_all.extend(wts)
+                    n_windows += len(coin_w)
+                except Exception as e:
+                    print(f"  [WARN] {fpath}: {e}")
+
+            if csv_files:
+                print(f"  {exchange}/{regime_dir}: {len(csv_files)} files → "
+                      f"{n_windows} windows  (label={label})")
+
+    if not X_coin_all:
+        empty = np.empty((0, TIMESTEPS, NUM_FEATURES), dtype=np.float32)
+        return empty, empty, np.empty(0, dtype=np.float32), np.empty(0)
+
+    return (np.array(X_coin_all,  dtype=np.float32),
+            np.array(X_mkt_all,   dtype=np.float32),
+            np.array(y_all,       dtype=np.float32),
+            np.array(w_all,       dtype=np.float32))
+
+
+# ── DataLoader factory ────────────────────────────────────────────────────────
+
+def make_loader(dataset: PumpDataset, batch_size: int,
+                shuffle: bool = True) -> DataLoader:
+    if shuffle:
+        # Combine class-balance weight with 9-cell regime weight
+        y        = dataset.y.numpy().astype(int)
+        counts   = np.bincount(y, minlength=2).clip(min=1)
+        cls_w    = (1.0 / counts)[y]
+        combined = cls_w * dataset.weights
+        sampler  = WeightedRandomSampler(combined, num_samples=len(combined))
+        return DataLoader(dataset, batch_size=batch_size, sampler=sampler)
+    return DataLoader(dataset, batch_size=batch_size, shuffle=False)
+
+
+# ── Training loop ─────────────────────────────────────────────────────────────
+
+def train():
+    print("=" * 65)
+    print("  CNN PumpDetector v3  (dual-stream: coin + market context)")
+    print(f"  Features per stream : {ALL_FEATURES}")
+    print(f"  Train exchanges     : {TRAIN_EXCHANGES}")
+    print(f"  Test  exchanges     : {TEST_EXCHANGES}  (zero-shot)")
+    print(f"  Device              : {DEVICE}")
+    print("=" * 65)
+
+    print("\nLoading training data...")
+    X_coin_tr, X_mkt_tr, y_tr, w_tr = load_dataset(TRAIN_EXCHANGES)
+    if len(X_coin_tr) == 0:
+        print("\nERROR: No training data found.")
+        print("Run scripts/reconstruct_orderbook.py first.")
+        return
+
+    pumps_tr = int(y_tr.sum())
+    ctrl_tr  = int((y_tr == 0).sum())
+    print(f"\n  Train total  : {len(X_coin_tr)} windows  ({pumps_tr} pump, {ctrl_tr} control)")
+    print(f"  Market ctx   : {'_market_ctx.csv found for some files' if X_mkt_tr.mean() != 1.0 else 'neutral fill (run fetch_market_context.py)'}")
+
+    print("\nLoading zero-shot test data...")
+    X_coin_te, X_mkt_te, y_te, w_te = load_dataset(TEST_EXCHANGES)
+    if len(X_coin_te):
+        print(f"  Test  total  : {len(X_coin_te)} windows  "
+              f"({int(y_te.sum())} pump, {int((y_te==0).sum())} control)")
+
+    # 80/20 split
+    idx   = np.random.permutation(len(X_coin_tr))
+    split = int(0.8 * len(idx))
+    tr_idx, val_idx = idx[:split], idx[split:]
+
+    train_ds = PumpDataset(X_coin_tr[tr_idx],  X_mkt_tr[tr_idx],
+                           y_tr[tr_idx],        w_tr[tr_idx])
+    val_ds   = PumpDataset(X_coin_tr[val_idx], X_mkt_tr[val_idx],
+                           y_tr[val_idx],       w_tr[val_idx])
+
+    train_loader = make_loader(train_ds, BATCH_SIZE, shuffle=True)
+    val_loader   = make_loader(val_ds,   BATCH_SIZE, shuffle=False)
+
+    model     = PumpDetectorV3(num_coin_features=NUM_FEATURES,
+                               num_market_features=NUM_FEATURES).to(DEVICE)
+    optimizer = optim.Adam(model.parameters(), lr=LR, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='max', patience=6, factor=0.5)
+    criterion = nn.BCELoss()
+
+    best_val_auc = 0.0
+    print(f"\n{'Epoch':>6}  {'Train Loss':>12}  {'Val AUC':>9}")
+    print("-" * 34)
+
+    for epoch in range(1, EPOCHS + 1):
+        model.train()
+        total_loss = 0.0
+        for x_coin, x_mkt, yb in train_loader:
+            x_coin, x_mkt, yb = x_coin.to(DEVICE), x_mkt.to(DEVICE), yb.to(DEVICE)
+            optimizer.zero_grad()
+            loss = criterion(model(x_coin, x_mkt), yb)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+
+        model.eval()
+        preds, labels = [], []
+        with torch.no_grad():
+            for x_coin, x_mkt, yb in val_loader:
+                preds.extend(model(x_coin.to(DEVICE),
+                                   x_mkt.to(DEVICE)).cpu().numpy())
+                labels.extend(yb.numpy())
+
+        val_auc = roc_auc_score(labels, preds)
+        scheduler.step(val_auc)
+
+        avg_loss = total_loss / len(train_loader)
+        if epoch % 5 == 0 or epoch == 1:
+            print(f"{epoch:>6}  {avg_loss:>12.4f}  {val_auc:>9.4f}")
+
+        if val_auc > best_val_auc:
+            best_val_auc = val_auc
+            os.makedirs(os.path.dirname(MODEL_SAVE_PATH), exist_ok=True)
+            torch.save(model.state_dict(), MODEL_SAVE_PATH)
+
+    print("-" * 34)
+    print(f"  Best validation AUC : {best_val_auc:.4f}")
+    print(f"  Model saved to      : {MODEL_SAVE_PATH}")
+
+    # ── Zero-shot transfer test ───────────────────────────────────────────────
+    if len(X_coin_te) == 0:
+        print("\n  No test exchange data — skipping zero-shot evaluation.")
+        return
+
+    print("\n" + "=" * 65)
+    print("  Zero-Shot Transfer Test  (Bybit + OKX — never seen during training)")
+    print("=" * 65)
+
+    model.load_state_dict(torch.load(MODEL_SAVE_PATH, map_location=DEVICE))
+    model.eval()
+
+    test_ds     = PumpDataset(X_coin_te, X_mkt_te, y_te, w_te)
+    test_loader = make_loader(test_ds, BATCH_SIZE, shuffle=False)
+    preds, labels = [], []
+    with torch.no_grad():
+        for x_coin, x_mkt, yb in test_loader:
+            preds.extend(model(x_coin.to(DEVICE),
+                               x_mkt.to(DEVICE)).cpu().numpy())
+            labels.extend(yb.numpy())
+
+    preds    = np.array(preds)
+    labels   = np.array(labels)
+    test_auc = roc_auc_score(labels, preds)
+    bin_pred = (preds >= 0.5).astype(int)
+
+    print(f"\n  Zero-shot AUC : {test_auc:.4f}")
+    print()
+    print(classification_report(labels, bin_pred,
+                                target_names=["control", "pump"],
+                                zero_division=0))
+
+    if test_auc >= 0.80:
+        print("  RESULT: Strong cross-exchange generalisation.")
+    elif test_auc >= 0.65:
+        print("  RESULT: Moderate generalisation — more real data will help.")
+    else:
+        print("  RESULT: Weak transfer — consider domain adaptation.")
+
+
+if __name__ == "__main__":
+    train()
