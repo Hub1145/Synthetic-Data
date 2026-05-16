@@ -117,6 +117,10 @@ def _run_step(step_num: int, name: str, script: str,
     t0  = time.time()
     lines: list = []
 
+    # Ensure all subprocesses can resolve `models.*` imports from the project root
+    env = os.environ.copy()
+    env["PYTHONPATH"] = PROJECT_ROOT + os.pathsep + env.get("PYTHONPATH", "")
+
     try:
         proc = subprocess.Popen(
             cmd,
@@ -126,6 +130,7 @@ def _run_step(step_num: int, name: str, script: str,
             encoding="utf-8",
             errors="replace",
             cwd=PROJECT_ROOT,
+            env=env,
         )
         for raw in proc.stdout:
             line = raw.rstrip()
