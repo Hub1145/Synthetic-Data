@@ -14,10 +14,12 @@ Pipeline stages
   Step  6  Fetch BTC market context   (classify normal / uncertain / pumped)
   Step  7  Fix remaining unknown market regimes + generate missing BTC context
   Step  8  Migrate control/ -> normal/ + uncertain/ by BTC regime
-  Step  9  Generate Type-B synthetic  (DirectL2VAE, 840 files)
-  Step 10  Fill missing trades files  (OHLCV buy-ratio method)
-  Step 11  Train PumpDetectorV3       (dual-stream CNN, 9-cell weights)
-  Step 12  Collect dataset stats and write run report
+  Step  9  Prepare L2 training data   (vectorise reconstructed/ into .npy)
+  Step 10  Train DirectL2VAE          (Type-B generator, latent dim 64)
+  Step 11  Generate Type-B synthetic  (DirectL2VAE, 840 files)
+  Step 12  Fill missing trades files  (OHLCV buy-ratio method)
+  Step 13  Train PumpDetectorV3       (dual-stream CNN, 9-cell weights)
+  Step 14  Collect dataset stats and write run report
 
 Usage
 -----
@@ -26,7 +28,8 @@ Usage
   python scripts/main.py --skip-label        # skip pump label verification
   python scripts/main.py --skip-reconstruct  # skip L2 reconstruction + depth
   python scripts/main.py --skip-meta         # skip peak tagging + market context
-  python scripts/main.py --skip-synthetic    # skip DirectL2VAE generation
+  python scripts/main.py --skip-vae-train    # skip DirectL2VAE training (use existing model)
+  python scripts/main.py --skip-synthetic    # skip DirectL2VAE training + generation entirely
   python scripts/main.py --skip-trades       # skip missing-trades fill
   python scripts/main.py --train-only        # training + report only (skip Steps 1-10)
   python scripts/main.py --report-only       # generate report without running any steps
@@ -53,7 +56,7 @@ if hasattr(sys.stdout, "reconfigure"):
 # Constants
 # ---------------------------------------------------------------------------
 
-TOTAL_STEPS  = 11
+TOTAL_STEPS  = 13
 EXCHANGES    = ["binance", "bybit", "kucoin", "okx", "huobi", "mexc", "gateio", "bitget"]
 REGIMES      = ["pumps", "normal", "uncertain"]
 TIERS        = ["real", "reconstructed", "synthetic"]
@@ -311,9 +314,11 @@ def write_report(stats: dict, metrics: dict, timings: dict,
         6:  "Fetch BTC market context",
         7:  "Fix unknown market regimes",
         8:  "Migrate control -> normal/uncertain",
-        9:  "Generate Type-B synthetic",
-        10: "Fill missing trades files",
-        11: "Train PumpDetectorV3",
+        9:  "Prepare L2 training data",
+        10: "Train DirectL2VAE",
+        11: "Generate Type-B synthetic",
+        12: "Fill missing trades files",
+        13: "Train PumpDetectorV3",
     }
     for num, name in step_names.items():
         result = step_results.get(num)
@@ -537,6 +542,64 @@ def write_report(stats: dict, metrics: dict, timings: dict,
 # Main
 # ---------------------------------------------------------------------------
 
+def _auto_skip(args) -> None:
+    """
+    Inspect the file system and set skip flags for steps whose output already exists.
+    Called when --resume is passed. Prints what it detected so the user can verify.
+    """
+    root = PROJECT_ROOT
+
+    def has_files(pattern: str) -> bool:
+        return len(glob.glob(os.path.join(root, pattern), recursive=True)) > 0
+
+    def exists(rel_path: str) -> bool:
+        return os.path.exists(os.path.join(root, rel_path))
+
+    checks = {}
+
+    # Steps 1-2: fetch + label — real/ has kline files
+    checks["fetch"]       = has_files("real/**/*_klines.csv") or has_files("real/**/*-1m-*.csv")
+    checks["label"]       = checks["fetch"]   # labelling runs on fetched data
+
+    # Steps 3-4: reconstruct + depth — reconstructed/ has L2 files
+    checks["reconstruct"] = has_files("reconstructed/**/*_L2.csv")
+
+    # Steps 5-8: meta / market context / migrate — all L2 have market_ctx files
+    l2_count  = len(glob.glob(os.path.join(root, "reconstructed/**/*_L2.csv"), recursive=True))
+    ctx_count = len(glob.glob(os.path.join(root, "reconstructed/**/*_market_ctx.csv"), recursive=True))
+    checks["meta"]        = l2_count > 0 and ctx_count >= l2_count * 0.9
+
+    # Steps 9-10: VAE training — both output files exist
+    checks["vae_train"]   = (exists("models/direct_l2_vae_v1.pth") and
+                             exists("models/l2_scaler.pkl"))
+
+    # Step 11: synthetic generation — synthetic/ has L2 files
+    checks["synthetic"]   = has_files("synthetic/**/*_L2.csv")
+
+    # Step 12: trades fill — at least 90% of L2 files have a trades file
+    trades_count = len(glob.glob(os.path.join(root, "reconstructed/**/*_trades.csv"), recursive=True))
+    checks["trades"]      = l2_count > 0 and trades_count >= l2_count * 0.9
+
+    # Apply flags
+    if checks["fetch"]:       args.skip_fetch       = True
+    if checks["label"]:       args.skip_label       = True
+    if checks["reconstruct"]: args.skip_reconstruct = True
+    if checks["meta"]:        args.skip_meta        = True
+    if checks["vae_train"]:   args.skip_vae_train   = True
+    if checks["synthetic"]:   args.skip_synthetic   = True
+    if checks["trades"]:      args.skip_trades      = True
+
+    log.info("  --resume: auto-detected completed steps:")
+    log.info(f"    Steps 1-2 (fetch + label)        : {'SKIP' if checks['fetch']       else 'RUN'}")
+    log.info(f"    Steps 3-4 (reconstruct + depth)  : {'SKIP' if checks['reconstruct'] else 'RUN'}")
+    log.info(f"    Steps 5-8 (meta + context)       : {'SKIP' if checks['meta']        else 'RUN'}")
+    log.info(f"    Steps 9-10 (train DirectL2VAE)   : {'SKIP' if checks['vae_train']   else 'RUN'}")
+    log.info(f"    Step 11   (generate synthetic)   : {'SKIP' if checks['synthetic']   else 'RUN'}")
+    log.info(f"    Step 12   (fill trades)          : {'SKIP' if checks['trades']      else 'RUN'}")
+    log.info(f"    Step 13   (train PumpDetectorV3) : RUN")
+    log.info("")
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="main.py",
@@ -552,8 +615,10 @@ def main():
                         help="Skip L2 reconstruction + depth expansion -- Steps 3-4")
     parser.add_argument("--skip-meta",         action="store_true",
                         help="Skip peak tagging + market context -- Steps 5-8")
+    parser.add_argument("--skip-vae-train",    action="store_true",
+                        help="Skip DirectL2VAE training -- Steps 9-10 (use existing model weights)")
     parser.add_argument("--skip-synthetic",    action="store_true",
-                        help="Skip DirectL2VAE generation -- Step 9")
+                        help="Skip DirectL2VAE training + generation entirely -- Steps 9-11")
     parser.add_argument("--skip-trades",       action="store_true",
                         help="Skip missing-trades fill -- Step 10")
     parser.add_argument("--train-only",        action="store_true",
@@ -564,11 +629,20 @@ def main():
                         help="Print the plan without executing any scripts")
     parser.add_argument("--continue-on-error", action="store_true",
                         help="Keep running even if a step fails")
+    parser.add_argument("--resume",            action="store_true",
+                        help="Auto-detect completed steps and skip them")
     args = parser.parse_args()
+
+    if args.skip_synthetic:
+        args.skip_vae_train = True   # no point training the VAE if we won't generate
 
     if args.train_only:
         args.skip_fetch = args.skip_label = args.skip_reconstruct = \
-            args.skip_meta = args.skip_synthetic = args.skip_trades = True
+            args.skip_meta = args.skip_vae_train = args.skip_synthetic = \
+            args.skip_trades = True
+
+    if args.resume:
+        _auto_skip(args)
 
     run_start    = time.time()
     timings:     dict = {}
@@ -676,23 +750,37 @@ def main():
          skip=args.skip_meta)
 
     # -----------------------------------------------------------------------
-    # Step 9 -- Generate Type-B synthetic
+    # Step 9 -- Prepare L2 training data for DirectL2VAE
     # -----------------------------------------------------------------------
-    step(9, "Generate Type-B synthetic (DirectL2VAE, 840 files)",
+    step(9, "Prepare L2 training data (vectorise reconstructed/ -> .npy)",
+         "prepare_l2_training_data.py",
+         skip=args.skip_vae_train)
+
+    # -----------------------------------------------------------------------
+    # Step 10 -- Train DirectL2VAE
+    # -----------------------------------------------------------------------
+    step(10, "Train DirectL2VAE (Type-B generator, latent dim 64)",
+         "train_direct_l2.py",
+         skip=args.skip_vae_train)
+
+    # -----------------------------------------------------------------------
+    # Step 11 -- Generate Type-B synthetic
+    # -----------------------------------------------------------------------
+    step(11, "Generate Type-B synthetic (DirectL2VAE, 840 files)",
          "generate_direct_synthetic.py",
          skip=args.skip_synthetic)
 
     # -----------------------------------------------------------------------
-    # Step 10 -- Fill missing trades
+    # Step 12 -- Fill missing trades
     # -----------------------------------------------------------------------
-    step(10, "Fill missing trades files (OHLCV buy-ratio method)",
+    step(12, "Fill missing trades files (OHLCV buy-ratio method)",
          "generate_missing_trades.py",
          skip=args.skip_trades)
 
     # -----------------------------------------------------------------------
-    # Step 11 -- Train PumpDetectorV3
+    # Step 13 -- Train PumpDetectorV3
     # -----------------------------------------------------------------------
-    training_out = step(11, "Train PumpDetectorV3 (dual-stream CNN)",
+    training_out = step(13, "Train PumpDetectorV3 (dual-stream CNN)",
                         "train_pump_detector.py")
 
     # -----------------------------------------------------------------------
