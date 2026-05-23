@@ -51,6 +51,12 @@ RECONSTRUCTED_BASE = "reconstructed"
 MIN_INCREASE          = 0.05   # 5%  minimum price spike
 RETRACEMENT_THRESHOLD = 0.30   # 30% dump required from peak
 
+# Fix 1: rolling mean window for smoothing before argmax
+SMOOTH_WINDOW = 5   # bars; adaptive — capped at len(mid)//5
+
+# Fix 2: flag events where fewer than this many bars exist after the peak
+MIN_POST_PEAK_BARS = 5
+
 # Peak magnitude buckets — used by the 9-cell market×coin regime matrix
 PEAK_BUCKETS = [
     ("micro",   0.05, 0.10),
@@ -98,9 +104,23 @@ def load_ohlcv(filepath):
     return df
 
 
+def _smooth(values: np.ndarray, window: int) -> np.ndarray:
+    """
+    Rolling mean with edge-padding so the output length matches the input.
+    Uses 'edge' padding (repeats first/last value) to avoid boundary artifacts.
+    """
+    if window < 2 or len(values) < window:
+        return values.copy()
+    half = window // 2
+    padded = np.pad(values, half, mode="edge")
+    kernel = np.ones(window) / window
+    smoothed = np.convolve(padded, kernel, mode="valid")
+    return smoothed[: len(values)]
+
+
 def calculate_pump_score(filepath):
     """
-    Returns (is_pump, retracement, increase).
+    Returns (is_pump, retracement, increase, peak_idx, peak_truncated).
     A genuine P&D requires: >= MIN_INCREASE spike AND >= RETRACEMENT_THRESHOLD dump.
     """
     df = load_ohlcv(filepath)
@@ -110,30 +130,44 @@ def calculate_pump_score(filepath):
 
     df = df.dropna(subset=['o', 'h', 'l', 'c']).reset_index(drop=True)
     if len(df) < 5:
-        return False, 0.0, 0.0
+        return False, 0.0, 0.0, 0, False
 
-    peak_loc      = int(df['h'].argmax())
-    peak_high     = float(df['h'].iloc[peak_loc])
-    initial_price = float(df['o'].iloc[0])
+    highs = df['h'].values.astype(float)
+    closes = df['c'].values.astype(float)
+    opens = df['o'].values.astype(float)
 
-    if initial_price <= 0:
-        return False, 0.0, 0.0
+    p0 = float(opens[0])
+    if p0 <= 0:
+        return False, 0.0, 0.0, 0, False
 
-    increase = (peak_high - initial_price) / initial_price
+    # ── Fix 1: smooth before argmax ──────────────────────────────────────
+    win = max(3, min(SMOOTH_WINDOW, len(highs) // 5))
+    smoothed = _smooth(highs, win)
+    peak_loc = int(np.argmax(smoothed))
+
+    peak_high = float(highs[peak_loc])
+    increase = (peak_high - p0) / p0
+
     if increase < MIN_INCREASE:
-        return False, 0.0, increase
+        return False, 0.0, increase, peak_loc, False
 
-    after_peak = df.iloc[peak_loc:]
-    if len(after_peak) < 2:
-        return False, 0.0, increase
+    # ── Fix 2: always compute retracement with available post-peak data ──
+    after = closes[peak_loc:]
+    peak_truncated = len(after) < MIN_POST_PEAK_BARS
 
-    min_close_after = float(after_peak['c'].min())
-    price_range     = peak_high - initial_price
+    if len(after) < 2:
+        # Peak is literally the last bar — no dump data at all
+        return False, 0.0, increase, peak_loc, True
+
+    min_close_after = float(after.min())
+    price_range = peak_high - p0
     if price_range <= 0:
-        return False, 0.0, increase
+        return False, 0.0, increase, peak_loc, peak_truncated
 
     retracement = (peak_high - min_close_after) / price_range
-    return retracement >= RETRACEMENT_THRESHOLD, retracement, increase
+    is_pump = (retracement >= RETRACEMENT_THRESHOLD)
+
+    return is_pump, retracement, increase, peak_loc, peak_truncated
 
 
 def get_peak_bucket(increase: float) -> str:
@@ -144,26 +178,40 @@ def get_peak_bucket(increase: float) -> str:
 
 
 def save_event_meta(exchange: str, regime: str, symbol: str, date: str,
-                    increase: float):
+                    increase: float, peak_idx: int, peak_truncated: bool):
     """Write _meta.json into the matching reconstructed/ symbol directory."""
     import json
     rec_dir = os.path.join(RECONSTRUCTED_BASE, exchange, regime, symbol)
     if not os.path.isdir(rec_dir):
         return
-    meta = {
-        "coin_regime":   regime.rstrip("s"),   # "pumps" → "pump", "control" → "control"
-        "market_regime": "unknown",             # filled later by fetch_market_context.py
-        "peak_pct":      round(increase * 100, 2),
-        "peak_bucket":   get_peak_bucket(increase) if regime == "pumps" else None,
-        "event_date":    date,
-    }
+
     # Write alongside every L2 file in this dir that matches the date
     for fname in os.listdir(rec_dir):
         if fname.endswith("_L2.csv") and (date in fname if date else True):
             stem = re.sub(r'(_direct_L2|_synthetic_L2|_L2)\.csv$', '', fname)
             meta_path = os.path.join(rec_dir, stem + "_meta.json")
+
+            existing = {}
+            if os.path.exists(meta_path):
+                try:
+                    with open(meta_path) as f:
+                        existing = json.load(f)
+                except Exception:
+                    pass
+
+            is_pump = (regime == "pumps")
+            existing.update({
+                "coin_regime":          regime.rstrip("s"),
+                "market_regime":        existing.get("market_regime", "unknown"),
+                "peak_pct":             round(increase * 100, 2) if is_pump else None,
+                "peak_bucket":          get_peak_bucket(increase) if is_pump else None,
+                "peak_idx":             int(peak_idx) if is_pump else None,
+                "peak_truncated":       peak_truncated,
+                "event_date":           date,
+            })
+
             with open(meta_path, "w") as f:
-                json.dump(meta, f, indent=2)
+                json.dump(existing, f, indent=2)
 
 
 def extract_date(filename):
@@ -436,7 +484,7 @@ def main():
                 total_checked += 1
 
                 try:
-                    is_pump, retracement, increase = calculate_pump_score(filepath)
+                    is_pump, retracement, increase, peak_loc, peak_truncated = calculate_pump_score(filepath)
                     label = "PUMP" if is_pump else "VOLATILE_CONTROL"
 
                     bucket = get_peak_bucket(increase) if is_pump else None
@@ -449,17 +497,19 @@ def main():
                         'retracement_pct': round(retracement * 100, 2),
                         'peak_bucket':     bucket,
                         'label':           label,
+                        'peak_truncated':  peak_truncated,
                     })
 
                     tag = "[PUMP]" if is_pump else "[ORGANIC]"
                     bucket_tag = f"  [{bucket}]" if bucket else ""
+                    trunc_tag = "  [TRUNCATED]" if peak_truncated else ""
                     print(f"  {tag:<10} {symbol:<12} {date_str}  "
                           f"+{increase*100:.1f}% spike  {retracement*100:.1f}% retracement"
-                          + bucket_tag + ("" if is_pump else "  -> control"))
+                          + bucket_tag + trunc_tag + ("" if is_pump else "  -> control"))
 
                     if is_pump:
                         confirmed += 1
-                        save_event_meta(exchange, "pumps", symbol, date_str, increase)
+                        save_event_meta(exchange, "pumps", symbol, date_str, increase, peak_loc, peak_truncated)
                         if tick_exchanges and date_str:
                             enrich_event(exchange, "pumps", symbol, sym_dir,
                                          filepath, date_str,
@@ -480,6 +530,7 @@ def main():
                         'exchange': exchange, 'symbol': symbol, 'date': date_str,
                         'file': fname, 'increase_pct': None,
                         'retracement_pct': None, 'label': 'ERROR',
+                        'peak_truncated': None,
                     })
 
     os.makedirs("data", exist_ok=True)
@@ -498,7 +549,7 @@ def main():
         print("  for the new control/ directories.")
 
     if tick_exchanges:
-        unavailable = ["kucoin", "okx", "gateio", "mexc", "huobi", "bitget"]
+        unavailable = ["kucoin", "okx", "gateio", "mexc", "bitget"]
         print(f"\n  Exchanges with no free historical tick data: {', '.join(unavailable)}")
         print("  Use Tardis.dev or Kaiko for paid historical tick coverage.")
 

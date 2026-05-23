@@ -125,7 +125,7 @@ def reconstruct_orderbooks(input_base, output_base):
                     trades_rows = []
                     for ts_idx, row in enumerate(df.itertuples(index=False)):
                         total_vol = float(row.v) if row.v and row.v == row.v else 0.0
-                        buy_vol   = float(row.taker_buy_base) if row.taker_buy_base == row.taker_buy_base else 0.0
+                        buy_vol   = float(row.taker_buy_base) if (row.taker_buy_base is not None and row.taker_buy_base == row.taker_buy_base) else 0.0
                         sell_vol  = max(0.0, total_vol - buy_vol)
                         mid_price = (float(row.h) + float(row.l)) / 2.0
                         if buy_vol > 0:

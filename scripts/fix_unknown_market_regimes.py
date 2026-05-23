@@ -24,8 +24,14 @@ import pandas as pd
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-TIMESTEPS = 96
-REGIMES   = ["normal", "uncertain", "pumped"]
+TIMESTEPS    = 96
+REGIMES      = ["normal", "uncertain", "pumped"]
+BG_VOLATILITIES = ["calm", "normal", "volatile"]
+
+# All 9 combinations cycled evenly
+REGIME_COMBOS = [
+    (r, v) for r in REGIMES for v in BG_VOLATILITIES
+]
 
 
 def generate_market_ctx(regime: str) -> pd.DataFrame:
@@ -92,7 +98,7 @@ def main():
     args = parser.parse_args()
 
     fixed = skipped = failed = 0
-    counter = 0  # for cycling through regimes
+    counter = 0  # cycles through all 9 (regime, volatility) combos
 
     for base in args.dirs:
         meta_files = glob.glob(os.path.join(base, "**", "*_meta.json"), recursive=True)
@@ -106,19 +112,24 @@ def main():
                 failed += 1
                 continue
 
-            if meta.get("market_regime", "unknown") != "unknown":
+            needs_regime = meta.get("market_regime", "unknown") == "unknown"
+            needs_vol    = "background_volatility" not in meta
+
+            if not needs_regime and not needs_vol:
                 skipped += 1
                 continue
 
-            regime = REGIMES[counter % len(REGIMES)]
+            regime, bg_vol = REGIME_COMBOS[counter % len(REGIME_COMBOS)]
             counter += 1
 
             ctx_path = ctx_path_for(mpath)
             try:
-                ctx_df = generate_market_ctx(regime)
-                ctx_df.to_csv(ctx_path, index=False)
+                if needs_regime:
+                    ctx_df = generate_market_ctx(regime)
+                    ctx_df.to_csv(ctx_path, index=False)
+                    meta["market_regime"] = regime
 
-                meta["market_regime"] = regime
+                meta["background_volatility"] = bg_vol
                 with open(mpath, "w") as f:
                     json.dump(meta, f, indent=2)
 
@@ -129,9 +140,9 @@ def main():
 
     print(f"\n{'='*60}")
     print(f"  Fixed   : {fixed}")
-    print(f"  Skipped : {skipped}  (already had regime)")
+    print(f"  Skipped : {skipped}  (already complete)")
     print(f"  Failed  : {failed}")
-    print(f"  Regime distribution (approx): {fixed//3} each of normal/uncertain/pumped")
+    print(f"  Combos  : {len(REGIME_COMBOS)} (3 regimes x 3 volatilities, cycled evenly)")
     print(f"{'='*60}")
 
 

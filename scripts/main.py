@@ -6,20 +6,21 @@ structured run report with dataset statistics and model performance metrics.
 
 Pipeline stages
 ---------------
-  Step  1  Fetch pump + control OHLCV klines  (all 8 exchanges)
-  Step  2  Verify pump labels + fetch real trade ticks
-  Step  3  Reconstruct L2 orderbook from OHLCV
-  Step  4  Expand to 10-level orderbook depth
-  Step  5  Tag peak magnitude buckets  (meta.json)
-  Step  6  Fetch BTC market context   (classify normal / uncertain / pumped)
-  Step  7  Fix remaining unknown market regimes + generate missing BTC context
-  Step  8  Migrate control/ -> normal/ + uncertain/ by BTC regime
-  Step  9  Prepare L2 training data   (vectorise reconstructed/ into .npy)
-  Step 10  Train DirectL2VAE          (Type-B generator, latent dim 64)
-  Step 11  Generate Type-B synthetic  (DirectL2VAE, 840 files)
-  Step 12  Fill missing trades files  (OHLCV buy-ratio method)
-  Step 13  Train PumpDetectorV3       (dual-stream CNN, 9-cell weights)
-  Step 14  Collect dataset stats and write run report
+  Step  1  Fetch pump OHLCV klines           (7 exchanges — Binance + 6 via direct REST)
+  Step  2  Fetch volatile-control OHLCV      (7 exchanges — Binance + 6 via direct REST)
+  Step  3  Verify pump labels + fetch real trade ticks
+  Step  4  Reconstruct L2 orderbook from OHLCV
+  Step  5  Expand to 10-level orderbook depth
+  Step  6  Tag peak magnitude buckets  (meta.json)
+  Step  7  Fetch market regime context  (classify normal / uncertain / pumped)
+  Step  8  Fix remaining unknown market regimes + generate missing context
+  Step  9  Migrate control/ -> normal/ + uncertain/ by market regime
+  Step 10  Prepare L2 training data   (vectorise reconstructed/ into .npy)
+  Step 11  Train DirectL2VAE          (Type-B generator, latent dim 64)
+  Step 12  Generate Type-B synthetic  (DirectL2VAE, 840 files)
+  Step 13  Fill missing trades files  (OHLCV buy-ratio method)
+  Step 14  Train PumpDetectorV3       (dual-stream CNN, 18-cell weights)
+  Step 15  Collect dataset stats and write run report
 
 Usage
 -----
@@ -56,8 +57,8 @@ if hasattr(sys.stdout, "reconfigure"):
 # Constants
 # ---------------------------------------------------------------------------
 
-TOTAL_STEPS  = 13
-EXCHANGES    = ["binance", "bybit", "kucoin", "okx", "huobi", "mexc", "gateio", "bitget"]
+TOTAL_STEPS  = 14
+EXCHANGES    = ["binance", "bybit", "kucoin", "okx", "mexc", "gateio", "bitget"]
 REGIMES      = ["pumps", "normal", "uncertain"]
 TIERS        = ["real", "reconstructed", "synthetic"]
 
@@ -306,19 +307,20 @@ def write_report(stats: dict, metrics: dict, timings: dict,
     out.append("  PIPELINE STEP SUMMARY")
     out.append(sep70d)
     step_names = {
-        1:  "Fetch pump + control OHLCV",
-        2:  "Verify labels + fetch trades",
-        3:  "Reconstruct L2 orderbook",
-        4:  "Expand to 10-level depth",
-        5:  "Tag peak magnitude buckets",
-        6:  "Fetch BTC market context",
-        7:  "Fix unknown market regimes",
-        8:  "Migrate control -> normal/uncertain",
-        9:  "Prepare L2 training data",
-        10: "Train DirectL2VAE",
-        11: "Generate Type-B synthetic",
-        12: "Fill missing trades files",
-        13: "Train PumpDetectorV3",
+        1:  "Fetch pump OHLCV",
+        2:  "Fetch volatile-control OHLCV",
+        3:  "Verify labels + fetch trades",
+        4:  "Reconstruct L2 orderbook",
+        5:  "Expand to 10-level depth",
+        6:  "Tag peak magnitude buckets",
+        7:  "Fetch market regime context",
+        8:  "Fix unknown market regimes",
+        9:  "Migrate control -> normal/uncertain",
+        10: "Prepare L2 training data",
+        11: "Train DirectL2VAE",
+        12: "Generate Type-B synthetic",
+        13: "Fill missing trades files",
+        14: "Train PumpDetectorV3",
     }
     for num, name in step_names.items():
         result = step_results.get(num)
@@ -366,18 +368,18 @@ def write_report(stats: dict, metrics: dict, timings: dict,
 
     # ---- 3x3 detection matrix breakdown ------------------------------------
     out.append(sep70d)
-    out.append("  3x3 DETECTION MATRIX  (coin label x BTC market regime)")
+    out.append("  3x3 DETECTION MATRIX  (coin label x market regime)")
     out.append(sep70d)
     out.append("")
-    out.append("  Label        | BTC Normal | BTC Uncertain | BTC Pumped")
+    out.append("  Label        | Mkt Normal | Mkt Uncertain | Mkt Pumped")
     out.append("  -------------|------------|---------------|------------")
     out.append("  Coin: Pump   | Most suspicious (weight 3.0) | 2.0 | 1.0")
     out.append("  Coin: Control| Hard negative   (weight 2.5) | 1.5 | 1.0")
     out.append("")
     out.append("  Directory mapping:")
     out.append("    pumps/     -- confirmed pump-and-dump  (label=1)")
-    out.append("    normal/    -- control, BTC flat        (label=0)")
-    out.append("    uncertain/ -- control, BTC elevated    (label=0)")
+    out.append("    normal/    -- control, market flat     (label=0)")
+    out.append("    uncertain/ -- control, market elevated (label=0)")
     out.append("")
 
     # ---- Model performance -------------------------------------------------
@@ -392,11 +394,11 @@ def write_report(stats: dict, metrics: dict, timings: dict,
     out.append("    Weights file : models/pump_detector_v3.pth")
     out.append("")
     out.append("  Training configuration")
-    out.append("    Train exchanges : Binance, KuCoin, Huobi, MEXC, Gate.io, Bitget")
+    out.append("    Train exchanges : Binance, KuCoin, MEXC, Gate.io, Bitget")
     out.append("    Zero-shot test  : Bybit, OKX  (never seen during training)")
     out.append("    Window          : 96 timesteps  |  50% overlap (step=48)")
     out.append("    Epochs          : 60  |  Batch: 64  |  Optimizer: Adam (lr=1e-3)")
-    out.append("    Class handling  : WeightedRandomSampler  +  9-cell sample weights")
+    out.append("    Class handling  : WeightedRandomSampler  +  18-cell sample weights")
     out.append("")
 
     if metrics.get("total_train_windows"):
@@ -498,7 +500,7 @@ def write_report(stats: dict, metrics: dict, timings: dict,
     out.append("    cap of ~5,000 pump windows at the next GPU retrain for stable AUC.")
     out.append("")
     out.append("  Real L2 unavailability:")
-    out.append("    KuCoin, OKX, Gate.io, MEXC, Huobi, Bitget have no free orderbook")
+    out.append("    KuCoin, OKX, Gate.io, MEXC, Bitget have no free orderbook")
     out.append("    archives. real/ for these exchanges holds reconstructed L2 as a proxy.")
     out.append("")
     out.append("  Trade tick coverage:")
@@ -590,13 +592,14 @@ def _auto_skip(args) -> None:
     if checks["trades"]:      args.skip_trades      = True
 
     log.info("  --resume: auto-detected completed steps:")
-    log.info(f"    Steps 1-2 (fetch + label)        : {'SKIP' if checks['fetch']       else 'RUN'}")
-    log.info(f"    Steps 3-4 (reconstruct + depth)  : {'SKIP' if checks['reconstruct'] else 'RUN'}")
-    log.info(f"    Steps 5-8 (meta + context)       : {'SKIP' if checks['meta']        else 'RUN'}")
-    log.info(f"    Steps 9-10 (train DirectL2VAE)   : {'SKIP' if checks['vae_train']   else 'RUN'}")
-    log.info(f"    Step 11   (generate synthetic)   : {'SKIP' if checks['synthetic']   else 'RUN'}")
-    log.info(f"    Step 12   (fill trades)          : {'SKIP' if checks['trades']      else 'RUN'}")
-    log.info(f"    Step 13   (train PumpDetectorV3) : RUN")
+    log.info(f"    Steps 1-2  (fetch pump + control) : {'SKIP' if checks['fetch']       else 'RUN'}")
+    log.info(f"    Step  3    (verify labels)         : {'SKIP' if checks['label']       else 'RUN'}")
+    log.info(f"    Steps 4-5  (reconstruct + depth)  : {'SKIP' if checks['reconstruct'] else 'RUN'}")
+    log.info(f"    Steps 6-9  (meta + context)       : {'SKIP' if checks['meta']        else 'RUN'}")
+    log.info(f"    Steps 10-11 (train DirectL2VAE)   : {'SKIP' if checks['vae_train']   else 'RUN'}")
+    log.info(f"    Step  12   (generate synthetic)   : {'SKIP' if checks['synthetic']   else 'RUN'}")
+    log.info(f"    Step  13   (fill trades)          : {'SKIP' if checks['trades']      else 'RUN'}")
+    log.info(f"    Step  14   (train PumpDetectorV3) : RUN")
     log.info("")
 
 
@@ -694,100 +697,107 @@ def main():
         return out
 
     # -----------------------------------------------------------------------
-    # Step 1 -- Fetch OHLCV
+    # Step 1 -- Fetch pump OHLCV
     # -----------------------------------------------------------------------
-    step(1, "Fetch pump + control OHLCV (all 8 exchanges)",
+    step(1, "Fetch pump OHLCV (7 exchanges)",
          "fetch_all_pump_data.py",
          skip=args.skip_fetch)
 
     # -----------------------------------------------------------------------
-    # Step 2 -- Verify labels + real trades
+    # Step 2 -- Fetch volatile-control OHLCV
     # -----------------------------------------------------------------------
-    step(2, "Verify pump labels (30% retracement) + fetch real trades",
+    step(2, "Fetch volatile-control OHLCV (7 exchanges)",
+         "fetch_control_data.py",
+         skip=args.skip_fetch)
+
+    # -----------------------------------------------------------------------
+    # Step 3 -- Verify labels + real trades
+    # -----------------------------------------------------------------------
+    step(3, "Verify pump labels (30% retracement) + fetch real trades",
          "fetch_and_label_tradebook_data.py",
          skip=args.skip_label)
 
     # -----------------------------------------------------------------------
-    # Step 3 -- Reconstruct L2
+    # Step 4 -- Reconstruct L2
     # -----------------------------------------------------------------------
-    step(3, "Reconstruct L2 orderbook from OHLCV",
+    step(4, "Reconstruct L2 orderbook from OHLCV",
          "reconstruct_orderbook.py",
          skip=args.skip_reconstruct)
 
     # -----------------------------------------------------------------------
-    # Step 4 -- Add 10-level depth
+    # Step 5 -- Add 10-level depth
     # -----------------------------------------------------------------------
-    step(4, "Expand to 10-level orderbook depth",
+    step(5, "Expand to 10-level orderbook depth",
          "add_orderbook_depth.py",
          skip=args.skip_reconstruct)
 
     # -----------------------------------------------------------------------
-    # Step 5 -- Tag peak buckets
+    # Step 6 -- Tag peak buckets
     # -----------------------------------------------------------------------
-    step(5, "Tag peak magnitude buckets (meta.json)",
+    step(6, "Tag peak magnitude buckets (meta.json)",
          "tag_peak_buckets.py",
          skip=args.skip_meta)
 
     # -----------------------------------------------------------------------
-    # Step 6 -- BTC market context
+    # Step 7 -- Market regime context
     # -----------------------------------------------------------------------
-    step(6, "Fetch BTC market context (normal / uncertain / pumped)",
+    step(7, "Fetch market regime context (normal / uncertain / pumped)",
          "fetch_market_context.py",
          skip=args.skip_meta)
 
     # -----------------------------------------------------------------------
-    # Step 7 -- Fix unknown regimes
+    # Step 8 -- Fix unknown regimes
     # -----------------------------------------------------------------------
-    step(7, "Fix remaining unknown market regimes + generate BTC context",
+    step(8, "Fix remaining unknown market regimes + generate missing context",
          "fix_unknown_market_regimes.py",
          skip=args.skip_meta)
 
     # -----------------------------------------------------------------------
-    # Step 8 -- Migrate control/ -> normal/ + uncertain/
+    # Step 9 -- Migrate control/ -> normal/ + uncertain/
     # -----------------------------------------------------------------------
-    step(8, "Migrate control/ -> normal/ + uncertain/ by BTC regime",
+    step(9, "Migrate control/ -> normal/ + uncertain/ by market regime",
          "migrate_control_to_regimes.py",
          skip=args.skip_meta)
 
     # -----------------------------------------------------------------------
-    # Step 9 -- Prepare L2 training data for DirectL2VAE
+    # Step 10 -- Prepare L2 training data for DirectL2VAE
     # -----------------------------------------------------------------------
-    step(9, "Prepare L2 training data (vectorise reconstructed/ -> .npy)",
+    step(10, "Prepare L2 training data (vectorise reconstructed/ -> .npy)",
          "prepare_l2_training_data.py",
          skip=args.skip_vae_train)
 
     # -----------------------------------------------------------------------
-    # Step 10 -- Train DirectL2VAE
+    # Step 11 -- Train DirectL2VAE
     # -----------------------------------------------------------------------
-    step(10, "Train DirectL2VAE (Type-B generator, latent dim 64)",
+    step(11, "Train DirectL2VAE (Type-B generator, latent dim 64)",
          "train_direct_l2.py",
          skip=args.skip_vae_train)
 
     # -----------------------------------------------------------------------
-    # Step 11 -- Generate Type-B synthetic
+    # Step 12 -- Generate Type-B synthetic
     # -----------------------------------------------------------------------
-    step(11, "Generate Type-B synthetic (DirectL2VAE, 840 files)",
+    step(12, "Generate Type-B synthetic (DirectL2VAE, 840 files)",
          "generate_direct_synthetic.py",
          skip=args.skip_synthetic)
 
     # -----------------------------------------------------------------------
-    # Step 12 -- Fill missing trades
+    # Step 13 -- Fill missing trades
     # -----------------------------------------------------------------------
-    step(12, "Fill missing trades files (OHLCV buy-ratio method)",
+    step(13, "Fill missing trades files (OHLCV buy-ratio method)",
          "generate_missing_trades.py",
          skip=args.skip_trades)
 
     # -----------------------------------------------------------------------
-    # Step 13 -- Train PumpDetectorV3
+    # Step 14 -- Train PumpDetectorV3
     # -----------------------------------------------------------------------
-    training_out = step(13, "Train PumpDetectorV3 (dual-stream CNN)",
+    training_out = step(14, "Train PumpDetectorV3 (dual-stream CNN)",
                         "train_pump_detector.py")
 
     # -----------------------------------------------------------------------
-    # Step 12 -- Collect stats and write report
+    # Collect stats and write report
     # -----------------------------------------------------------------------
     log.info("-" * 70)
-    log.info(f"Step 12  --  Collect dataset statistics and write report")
+    log.info(f"Collecting dataset statistics and writing report ...")
     log.info("-" * 70)
 
     metrics = parse_training_output(training_out or [])

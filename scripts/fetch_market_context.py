@@ -56,6 +56,10 @@ MKT_UNCERTAIN_THRESH  = 0.03   # 3%+ move without clear dump = uncertain
 MKT_PUMP_SPIKE_THRESH = 0.05   # 5%+ spike
 MKT_PUMP_RETRACE      = 0.20   # 20%+ retracement = BTC was pumped
 
+# Background volatility thresholds (std dev of 1-min BTC close-price returns)
+VOL_CALM_THRESHOLD     = 0.0010   # < 0.10% per bar → calm
+VOL_VOLATILE_THRESHOLD = 0.0030   # > 0.30% per bar → volatile
+
 TIMESTEPS = 96   # match the coin window length
 
 COLS_12 = ['open_ts_ms', 'o', 'h', 'l', 'c', 'v',
@@ -137,6 +141,26 @@ def classify_btc_regime(df: pd.DataFrame) -> str:
     return "pumped" if retracement >= MKT_PUMP_RETRACE else "uncertain"
 
 
+def classify_btc_volatility(df: pd.DataFrame) -> str:
+    """
+    Classify background market volatility from BTC 1m close-price returns.
+    Returns calm / normal / volatile.
+    """
+    if df is None or len(df) < 5:
+        return "normal"
+    try:
+        closes  = df["c"].astype(float).values
+        returns = np.diff(closes) / closes[:-1]
+        vol     = float(np.std(returns))
+        if vol < VOL_CALM_THRESHOLD:
+            return "calm"
+        if vol > VOL_VOLATILE_THRESHOLD:
+            return "volatile"
+        return "normal"
+    except Exception:
+        return "normal"
+
+
 # ── Market context L2 builder ──────────────────────────────────────────────────
 
 def build_market_ctx(btc_df: pd.DataFrame, regime: str) -> pd.DataFrame:
@@ -207,14 +231,15 @@ def ctx_path_for(l2_path: str) -> str:
     return re.sub(r'(_direct_L2|_synthetic_L2|_L2)\.csv$', '_market_ctx.csv', l2_path)
 
 
-def update_meta_regime(meta_path: str, regime: str):
+def update_meta_regime(meta_path: str, regime: str, bg_volatility: str):
     try:
         if os.path.exists(meta_path):
             with open(meta_path) as f:
                 meta = json.load(f)
         else:
             meta = {}
-        meta["market_regime"] = regime
+        meta["market_regime"]        = regime
+        meta["background_volatility"] = bg_volatility
         with open(meta_path, "w") as f:
             json.dump(meta, f, indent=2)
     except Exception:
@@ -258,12 +283,13 @@ def process_exchange(exchange: str, overwrite: bool):
                 failed += 1
                 continue
 
-            regime = classify_btc_regime(btc_df)
-            ctx_df = build_market_ctx(btc_df, regime)
+            regime        = classify_btc_regime(btc_df)
+            bg_volatility = classify_btc_volatility(btc_df)
+            ctx_df        = build_market_ctx(btc_df, regime)
 
             try:
                 ctx_df.to_csv(cp, index=False)
-                update_meta_regime(meta_path_for(l2_path), regime)
+                update_meta_regime(meta_path_for(l2_path), regime, bg_volatility)
                 saved += 1
             except Exception as e:
                 print(f"    [SAVE ERR] {cp}: {e}")

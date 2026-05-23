@@ -39,7 +39,7 @@ Model Training
   prepare_l2_training_data.py       ← Vectorise reconstructed/ L2 into data/l2_training_samples.npy
   train_global_vae.py               ← Train BaseVAE on real OHLCV (Type-A generator)
   train_direct_l2.py                ← Train DirectL2VAE on reconstructed L2 (Type-B generator)
-  train_pump_detector.py            ← Train PumpDetectorV3 (dual-stream, 9-cell weights)
+  train_pump_detector.py            ← Train PumpDetectorV3 (dual-stream, 18-cell weights)
 
 Validation
   test_pumpable_extractor.py        ← Score all L2 files using PUMPABLE COINS extractor
@@ -65,11 +65,21 @@ Downloads 1-minute OHLCV klines from **Binance Data Vision** for every event in 
 
 ### `fetch_all_pump_data.py`
 
-Comprehensive multi-exchange fetcher. Reads pump candidates from `data/global_deep_scan_pumps.csv` (produced by `scan_multi_exchange.py`) and downloads the corresponding 1-minute OHLCV via CCXT.
+Comprehensive multi-exchange fetcher. Reads pump candidates from `data/global_deep_scan_pumps.csv` (produced by `scan_multi_exchange.py`) and downloads the corresponding 1-minute OHLCV using each exchange's native REST API directly — no CCXT.
 
-- Exchanges covered: Binance, Bybit, KuCoin, OKX, Huobi, MEXC, Gate.io, Bitget
+| Exchange | Source |
+|---|---|
+| Binance | `data.binance.vision` public archive (full history, no auth) |
+| Bybit | `api.bybit.com/v5/market/kline` with explicit start/end timestamps |
+| KuCoin | `api.kucoin.com/api/v1/market/candles` with `startAt`/`endAt` (Unix seconds) |
+| OKX | `okx.com/api/v5/market/history-candles` paginated backwards |
+| Gate.io | `api.gateio.ws/api/v4/spot/candlesticks` with timeframe cascade (1m→5m→1h→4h) |
+| MEXC | `api.mexc.com/api/v3/klines` with timeframe cascade (1m→5m→30m→60m→4h→1d) |
+| Bitget | `api.bitget.com/api/v2/spot/market/history-candles` with explicit timestamps |
+
 - Output: `real/[exchange]/pumps/[SYMBOL]/[SYMBOL]_[DATE]_klines.csv`
 - Skips already-downloaded events
+- `--exchange` flag to run a single exchange at a time
 
 ---
 
@@ -77,19 +87,39 @@ Comprehensive multi-exchange fetcher. Reads pump candidates from `data/global_de
 
 Fetches OHLCV for events that produced a large price spike but **failed** the 30% retracement threshold — these are organic volatility events, not pump-and-dumps. They form the hard-negative control set.
 
-- Reads: `data/scanned_pumps/[exchange]_pumps.csv` (volatile_control rows)
-- Output: `real/[exchange]/normal/[SYMBOL]/[SYMBOL]_[DATE]_klines.csv` (or `uncertain/` after BTC regime classification)
-- Accepts `--exchange` flag to fetch one exchange at a time (e.g., `--exchange huobi mexc gateio`)
-- After fetching, run `fetch_market_context.py` to assign BTC regime, then `migrate_control_to_regimes.py` to place files in the correct `normal/` or `uncertain/` subfolder
+Uses the same direct REST API fetchers as `fetch_all_pump_data.py` — no CCXT. All 7 active exchanges are supported.
+
+- Reads: `data/scanned_pumps/[exchange]_pumps.csv` (rows where `label == "volatile_control"`)
+- Output: `real/[exchange]/control/[SYMBOL]/[SYMBOL]_[DATE]_klines.csv`
+- Accepts `--exchange` flag to fetch one exchange at a time (e.g., `--exchange mexc gateio`)
+- After fetching, run `fetch_market_context.py` to assign market regime, then `migrate_control_to_regimes.py` to sort files into `normal/` or `uncertain/` subfolders
 
 ---
 
 ### `scan_multi_exchange.py`
 
-Live scanner that queries all 8 exchanges via CCXT and identifies coins with recent anomalous price behaviour matching pump-and-dump signatures.
+Scans all USDT and BTC pairs across 7 exchanges for pump-and-dump signatures using each exchange's native REST API directly — no CCXT.
 
-- Applies a spike threshold and 30% retracement filter to classify events
-- Writes candidate events to `data/scanned_pumps/[exchange]_pumps.csv`
+For each exchange the script performs two steps:
+1. **Symbol discovery** — calls the exchange's market-info endpoint to get the full list of active USDT/BTC spot pairs
+2. **Daily OHLCV scan** — fetches up to 200 daily candles per symbol and applies a sliding 20-candle window with the 30% retracement rule
+
+Events are classified as:
+- `pump` — spike ≥ 5% AND retracement ≥ 30% → goes to `real/[exchange]/pumps/` after OHLCV download
+- `volatile_control` — large spike but retracement < 30% → goes to `real/[exchange]/control/` as a hard negative
+
+| Exchange | Symbol endpoint | Daily OHLCV endpoint |
+|---|---|---|
+| Binance | `/api/v3/exchangeInfo` | `/api/v3/klines?interval=1d` |
+| Bybit | `/v5/market/instruments-info` | `/v5/market/kline?interval=D` |
+| KuCoin | `/api/v1/symbols` | `/api/v1/market/candles?type=1day` |
+| OKX | `/api/v5/public/instruments` | `/api/v5/market/history-candles?bar=1D` (paginated) |
+| Gate.io | `/api/v4/spot/currency_pairs` | `/api/v4/spot/candlesticks?interval=1d` |
+| MEXC | `/api/v3/exchangeInfo` | `/api/v3/klines?interval=1d` |
+| Bitget | `/api/v2/spot/public/symbols` | `/api/v2/spot/market/history-candles?granularity=1day` |
+
+- Output: `data/scanned_pumps/[exchange]_pumps.csv` per exchange and `data/global_deep_scan_pumps.csv` combined
+- Accepts `--exchange` flag to scan a subset (e.g. `--exchange bybit okx`)
 - Output feeds into `fetch_all_pump_data.py` and `fetch_control_data.py`
 
 ---
@@ -104,7 +134,7 @@ Verifies pump labels and enriches confirmed events with real trade ticks — two
 1. Price spike >= **5%** from the initial open
 2. Retracement >= **30%** from peak back toward the pre-pump price
 
-Events that pass stay in `pumps/`. Events that fail (organic volatility) are moved to `normal/` or `uncertain/` depending on BTC market regime during the event. A report is written to `data/labeling_report.csv`.
+Events that pass stay in `pumps/`. Events that fail (organic volatility) are moved to `normal/` or `uncertain/` depending on market regime during the event. A report is written to `data/labeling_report.csv`.
 
 **Enrich step** — for each confirmed pump, immediately fetches real trade ticks if a free archive is available:
 - **Binance** → `data.binance.vision/data/spot/daily/trades/` (full history)
@@ -172,12 +202,14 @@ python scripts/tag_peak_buckets.py --overwrite # re-tag everything
 
 For every event in `real/` and `reconstructed/`, downloads the BTCUSDT 1-minute kline for that date from Binance Data Vision (cached in `data/market_context/`), then:
 
-1. Classifies BTC's behaviour during that window as `normal` / `uncertain` / `pumped`
+1. Classifies the market's behaviour during that window as `normal` / `uncertain` / `pumped` (using BTC OHLCV as the market proxy)
 2. Builds a 6-feature market context sequence (`bid_price, ask_price, bid_size, ask_size, buy_ratio, aggressor_imbalance`) derived from BTC OHLCV
 3. Saves it as `*_market_ctx.csv` alongside the coin's L2 file
-4. Updates `market_regime` in the matching `*_meta.json`
+4. Updates `market_regime` and `background_volatility` in the matching `*_meta.json`
 
-BTC regime thresholds: < 3% move = normal · 3–8% without retracement = uncertain · ≥ 5% spike with ≥ 20% retracement = pumped.
+Market regime thresholds: < 3% move = normal · 3–8% without retracement = uncertain · ≥ 5% spike with ≥ 20% retracement = pumped.
+
+Background volatility is classified from the std dev of 1-min close-price returns: calm < 0.10%/bar · volatile > 0.30%/bar · normal in between.
 
 ```
 python scripts/fetch_market_context.py
@@ -191,7 +223,7 @@ python scripts/fetch_market_context.py --overwrite   # rebuild existing ctx file
 
 Fixes all `*_meta.json` files across `reconstructed/` and `synthetic/` where `market_regime` was left as `"unknown"` (caused by failed BTC kline downloads for future-dated events or older Type-A synthetic files).
 
-- Assigns `normal`, `uncertain`, or `pumped` in round-robin across all unknown files (~1,490 per regime)
+- Assigns one of 9 combinations (regime × background volatility) in round-robin across all unknown files — cycles through all 9 evenly
 - Generates a synthetic `*_market_ctx.csv` for each fixed file using statistical BTC price/volume profiles per regime
 - Regime profiles: `normal` = low-noise drift, balanced bid/ask; `uncertain` = moderate drift with spikes; `pumped` = sharp spike with 40–70% retracement
 - Safe to re-run — only touches files where `market_regime == "unknown"`
@@ -205,9 +237,9 @@ python scripts/fix_unknown_market_regimes.py
 
 ### `migrate_control_to_regimes.py`
 
-One-time migration that splits the legacy `control/` directory into `normal/` and `uncertain/` based on the BTC market regime stored in each symbol's `*_meta.json`.
+One-time migration that splits the legacy `control/` directory into `normal/` and `uncertain/` based on the market regime stored in each symbol's `*_meta.json`.
 
-**REGIME_MAP** (BTC regime → destination folder):
+**REGIME_MAP** (market regime → destination folder):
 - `normal` → `normal/`
 - `uncertain` → `uncertain/`
 - `pumped` → `uncertain/` (coin followed BTC momentum, not genuine pump — still a soft negative)
@@ -230,7 +262,7 @@ python scripts/migrate_control_to_regimes.py --dirs real        # apply to real/
 
 **Type-A synthetic generator.** Uses the trained `BaseVAE` (OHLCV-space, 24-step windows, latent dim 32) to sample new OHLCV sequences, then passes them through `reconstruct_orderbook.py` to produce L2 files.
 
-- Generates 100 samples per exchange (50 pump, 50 control) × 8 exchanges = 800 files
+- Generates 100 samples per exchange (50 pump, 50 control) × exchanges = 800+ files
 - Output: `synthetic/[exchange]/[regime]/[symbol]/[symbol]_synthetic_L2.csv`
 - Requires `models/global_vae_v1.pth` and `models/global_scaler_v1.pkl`
 - Type-A synthetic has no paired trades file (neutral fill applied during training)
@@ -313,15 +345,15 @@ Trains **PumpDetectorV3** — the dual-stream pump detection model.
 | Coin | `[96, 6]` — bid/ask price+size, buy_ratio, agg_imb | `*_L2.csv` + `*_trades.csv` |
 | Market | `[96, 6]` — same schema for BTC context | `*_market_ctx.csv` (neutral fill if missing) |
 
-**9-cell sample weighting** — each training window is weighted by its position in the coin×market regime matrix:
+**18-cell sample weighting** — each training window is weighted by its position in the coin × market regime × background volatility matrix. A pump during a calm, flat BTC market is the clearest manipulation signal (weight 4.0); a spike when BTC is also pumping in a volatile market is the least distinctive (weight 1.0):
 
-| Coin \ Market | Normal | Uncertain | Pumped |
-|---|---|---|---|
-| Pump | **3.0** (most suspicious) | 2.0 | 1.0 (least suspicious) |
-| Control | 2.5 (hard negative) | 1.5 | 1.0 (easy negative) |
+| Coin \ Market / Volatility | Normal·Calm | Normal·Normal | Normal·Volatile | Uncertain·Calm | Uncertain·Normal | Uncertain·Volatile | Pumped·Calm | Pumped·Normal | Pumped·Volatile |
+|---|---|---|---|---|---|---|---|---|---|
+| **Pump** | **4.0** | 3.0 | 2.0 | 2.5 | 2.0 | 1.5 | 1.5 | 1.0 | 1.0 |
+| **Control** | 3.5 | 2.5 | 1.5 | 2.0 | 1.5 | 1.0 | 1.5 | 1.0 | 1.0 |
 
 - Scans both `reconstructed/` and `synthetic/` for training windows
-- Train exchanges (6): Binance, KuCoin, Huobi, MEXC, Gate.io, Bitget
+- Train exchanges: Binance, KuCoin, MEXC, Gate.io, Bitget (+ Huobi historical data on disk)
 - Zero-shot test exchanges (2): Bybit, OKX
 - Saves to `models/pump_detector_v3.pth`
 
@@ -359,17 +391,20 @@ python scripts/run_pipeline.py --train-only       # run CNN training only
 ```
 
 Step order:
-1. `fetch_all_pump_data.py`
-2. `fetch_and_label_tradebook_data.py`
-3. `reconstruct_orderbook.py`
-4. `add_orderbook_depth.py`
-5. `tag_peak_buckets.py`
-6. `fetch_market_context.py`
-7. `fix_unknown_market_regimes.py`
-8. `migrate_control_to_regimes.py`
-9. `generate_direct_synthetic.py`
-10. `generate_missing_trades.py`
-11. `train_pump_detector.py`
+1. `fetch_all_pump_data.py` — pump OHLCV (7 exchanges via direct REST)
+2. `fetch_control_data.py` — volatile-control OHLCV (7 exchanges)
+3. `fetch_and_label_tradebook_data.py`
+4. `reconstruct_orderbook.py`
+5. `add_orderbook_depth.py`
+6. `tag_peak_buckets.py`
+7. `fetch_market_context.py`
+8. `fix_unknown_market_regimes.py`
+9. `migrate_control_to_regimes.py`
+10. `prepare_l2_training_data.py`
+11. `train_direct_l2.py`
+12. `generate_direct_synthetic.py`
+13. `generate_missing_trades.py`
+14. `train_pump_detector.py`
 
 ---
 
@@ -388,7 +423,7 @@ Step order:
 ## Prerequisites
 
 ```
-pip install torch numpy pandas scikit-learn ccxt requests joblib
+pip install torch numpy pandas scikit-learn requests joblib
 ```
 
 The `ohlcv-to-orderbook` binary must be on PATH for `reconstruct_orderbook.py`.

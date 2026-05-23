@@ -11,13 +11,19 @@ Input per sample:
   x_market [96, 6]  — same 6 features for BTC/market context
                        (neutral fill if no _market_ctx.csv found)
 
-9-cell sample weights (coin_regime × market_regime):
-  Coin:pump   + Market:normal    → 3.0   most suspicious — highest training signal
-  Coin:pump   + Market:uncertain → 2.0   ambiguous
-  Coin:pump   + Market:pumped    → 1.0   least suspicious
-  Coin:control + Market:normal   → 2.5   hard negative
-  Coin:control + Market:uncertain→ 1.5
-  Coin:control + Market:pumped   → 1.0   easy negative
+18-cell sample weights (coin_regime × market_regime × background_volatility):
+  Coin:pump   + Market:normal    + calm     → 4.0   most suspicious
+  Coin:pump   + Market:normal    + normal   → 3.0
+  Coin:pump   + Market:normal    + volatile → 2.0
+  Coin:pump   + Market:uncertain + calm     → 2.5
+  Coin:pump   + Market:uncertain + normal   → 2.0
+  Coin:pump   + Market:uncertain + volatile → 1.5
+  Coin:pump   + Market:pumped    + calm     → 1.5
+  Coin:pump   + Market:pumped    + normal   → 1.0
+  Coin:pump   + Market:pumped    + volatile → 1.0
+  Coin:control + Market:normal    + calm    → 3.5   hardest negative
+  Coin:control + Market:normal    + normal  → 2.5
+  ... (see CELL_WEIGHTS dict for all 18)
 
 Usage (from project root):
     python scripts/train_pump_detector.py
@@ -68,14 +74,29 @@ DEVICE     = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 NEUTRAL_BUY_RATIO = 0.5
 NEUTRAL_AGGRESSOR = 0.0
 
-# 9-cell weight matrix (coin_regime × market_regime)
+# 18-cell weight matrix: coin_regime × market_regime × background_volatility
+# calm background raises weight (no market noise to hide in — cleaner signal)
+# volatile background lowers weight (move may be noise amplification)
 CELL_WEIGHTS = {
-    ("pump",    "normal"):    3.0,
-    ("pump",    "uncertain"): 2.0,
-    ("pump",    "pumped"):    1.0,
-    ("control", "normal"):    2.5,
-    ("control", "uncertain"): 1.5,
-    ("control", "pumped"):    1.0,
+    # coin      market       volatility     weight
+    ("pump",    "normal",    "calm"):       4.0,
+    ("pump",    "normal",    "normal"):     3.0,
+    ("pump",    "normal",    "volatile"):   2.0,
+    ("pump",    "uncertain", "calm"):       2.5,
+    ("pump",    "uncertain", "normal"):     2.0,
+    ("pump",    "uncertain", "volatile"):   1.5,
+    ("pump",    "pumped",    "calm"):       1.5,
+    ("pump",    "pumped",    "normal"):     1.0,
+    ("pump",    "pumped",    "volatile"):   1.0,
+    ("control", "normal",    "calm"):       3.5,
+    ("control", "normal",    "normal"):     2.5,
+    ("control", "normal",    "volatile"):   1.5,
+    ("control", "uncertain", "calm"):       2.0,
+    ("control", "uncertain", "normal"):     1.5,
+    ("control", "uncertain", "volatile"):   1.0,
+    ("control", "pumped",    "calm"):       1.5,
+    ("control", "pumped",    "normal"):     1.0,
+    ("control", "pumped",    "volatile"):   1.0,
 }
 
 
@@ -166,17 +187,21 @@ def load_cell_weight(l2_path: str, label: int) -> float:
                        '_meta.json', l2_path)
     coin_regime   = "pump" if label == 1 else "control"
     market_regime = "normal"
+    bg_volatility = "normal"
     if os.path.exists(meta_path):
         try:
             with open(meta_path) as f:
                 meta = json.load(f)
-            coin_regime   = meta.get("coin_regime",   coin_regime)
-            market_regime = meta.get("market_regime", "normal")
+            coin_regime   = meta.get("coin_regime",          coin_regime)
+            market_regime = meta.get("market_regime",        "normal")
+            bg_volatility = meta.get("background_volatility", "normal")
             if market_regime == "unknown":
                 market_regime = "normal"
+            if bg_volatility == "unknown":
+                bg_volatility = "normal"
         except Exception:
             pass
-    return CELL_WEIGHTS.get((coin_regime, market_regime), 1.5)
+    return CELL_WEIGHTS.get((coin_regime, market_regime, bg_volatility), 1.5)
 
 
 # ── Window extraction ─────────────────────────────────────────────────────────
@@ -210,12 +235,17 @@ def extract_windows(l2_df: pd.DataFrame, l2_path: str,
         w_coin = coin_full[start:start + TIMESTEPS]
         if len(w_coin) != TIMESTEPS or not np.isfinite(w_coin).all():
             continue
-        # Market context is a fixed 96-step sequence; slide same window over it
-        # if it is longer (rare), otherwise repeat the whole sequence
+        # Market context is always a fixed 96-step sequence (one per event file).
+        # It represents the whole window's market regime — never offset-slice it.
+        # Pad with neutral fill if the file was short (edge case).
         if len(market_full) >= TIMESTEPS:
-            w_mkt = market_full[start:start + TIMESTEPS] if len(market_full) > TIMESTEPS else market_full
+            w_mkt = market_full[:TIMESTEPS]
         else:
-            w_mkt = market_full
+            pad = np.zeros((TIMESTEPS - len(market_full), market_full.shape[1]), dtype=np.float32)
+            pad[:, 0] = 1.0   # bid_price neutral
+            pad[:, 1] = 1.0   # ask_price neutral
+            pad[:, 4] = NEUTRAL_BUY_RATIO
+            w_mkt = np.concatenate([market_full, pad], axis=0)
 
         coin_windows.append(normalize_window(w_coin))
         market_windows.append(normalize_window(w_mkt))

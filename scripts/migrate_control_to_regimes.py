@@ -42,16 +42,17 @@ REGIME_MAP = {
 
 
 def find_paired_files(l2_path: str):
-    """Return all files in the same directory that share the same stem."""
+    """Return all files in the same directory that share the same stem.
+    Matches: *_L2.csv, *_trades.csv, *_meta.json, *_market_ctx.csv.
+    """
     stem = re.sub(r'(_direct_L2|_synthetic_L2|_L2)\.csv$', '', l2_path)
     candidates = []
     base_dir = os.path.dirname(l2_path)
     for f in os.listdir(base_dir):
         fpath = os.path.join(base_dir, f)
-        if fpath.startswith(stem) or fpath == l2_path:
+        if fpath.startswith(stem):
             candidates.append(fpath)
-    # include all files in the symbol directory (safest approach)
-    return [os.path.join(base_dir, f) for f in os.listdir(base_dir)]
+    return candidates
 
 
 def get_dest_dir_name(meta_path: str) -> str:

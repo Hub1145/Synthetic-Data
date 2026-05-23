@@ -108,7 +108,7 @@ def main():
     print()
     print("=" * 65)
     print("  Pipeline complete.")
-    print("  Trained model: models/pump_detector_v2.pth")
+    print("  Trained model: models/pump_detector_v3.pth")
     print("  Run inference: see detector.md for scoring examples.")
     print("=" * 65)
 
