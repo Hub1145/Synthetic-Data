@@ -1,12 +1,61 @@
 # Scripts Reference
 
-All scripts are run from the **project root** (one level above this folder), not from inside `scripts/`.
+All scripts are run from the **project root** (one level above `scripts/`), not from inside `scripts/`.
 
 ```
 python scripts/<script_name>.py
 ```
 
-Use `run_pipeline.py` to chain the common steps automatically.
+Use `main.py` to run the full pipeline automatically. Individual scripts can also be run directly for targeted re-runs.
+
+---
+
+## Orchestration
+
+### `main.py`
+
+Full 16-step pipeline orchestrator. Calls every script below as a subprocess in order and writes a structured run report to `output/`.
+
+```
+python scripts/main.py                       # full pipeline (Step 0 scan skipped by default)
+python scripts/main.py --with-scan           # also run exchange scanner (Step 0)
+python scripts/main.py --skip-fetch          # skip data download (Steps 1-3)
+python scripts/main.py --skip-label          # skip pump label verification (Step 4)
+python scripts/main.py --skip-reconstruct    # skip L2 reconstruction + depth (Steps 5-6)
+python scripts/main.py --skip-meta           # skip peak tagging + market context (Steps 7-10)
+python scripts/main.py --skip-vae-train      # skip DirectL2VAE training (Step 12)
+python scripts/main.py --skip-synthetic      # skip VAE training + generation (Steps 12-13)
+python scripts/main.py --skip-trades         # skip missing-trades fill (Step 14)
+python scripts/main.py --skip-calibrate      # skip threshold calibration (Step 16)
+python scripts/main.py --train-only          # Steps 15-16 only (skip all data prep)
+python scripts/main.py --resume              # auto-detect completed steps and skip them
+python scripts/main.py --dry-run             # print plan without executing
+python scripts/main.py --continue-on-error   # keep going even if a step fails
+```
+
+**Pipeline steps:**
+
+| Step | Script | Skip flag |
+|---|---|---|
+| 0 (opt-in) | `scan_multi_exchange.py` | `--with-scan` to enable |
+| 1 | `fetch_all_pump_data.py` | `--skip-fetch` |
+| 2 | `fetch_ardia_pumps.py` | `--skip-fetch` |
+| 3 | `fetch_control_data.py` | `--skip-fetch` |
+| 4 | `fetch_and_label_tradebook_data.py` | `--skip-label` |
+| 5 | `reconstruct_orderbook.py` | `--skip-reconstruct` |
+| 6 | `add_orderbook_depth.py` | `--skip-reconstruct` |
+| 7 | `tag_peak_buckets.py` | `--skip-meta` |
+| 8 | `fetch_market_context.py` | `--skip-meta` |
+| 9 | `fix_unknown_market_regimes.py` | `--skip-meta` |
+| 10 | `migrate_control_to_regimes.py` | `--skip-meta` |
+| 11 | `prepare_l2_training_data.py` | `--skip-vae-train` |
+| 12 | `train_direct_l2.py` | `--skip-vae-train` |
+| 13 | `generate_direct_synthetic.py` | `--skip-synthetic` |
+| 14 | `generate_missing_trades.py` | `--skip-trades` |
+| 15 | `train_pump_detector.py` | — |
+| 16 | `calibrate_threshold.py` | `--skip-calibrate` |
+
+The run report (`output/run_report_*.txt`) and structured JSON (`output/run_report_*.json`) capture dataset statistics, model performance (best AUC, mean AUC ± std), peak MAE, and per-step timing.
 
 ---
 
@@ -14,59 +63,66 @@ Use `run_pipeline.py` to chain the common steps automatically.
 
 ```
 Data Collection
-  fetch_ardia_pumps.py              ← Binance P&D events (ArdiaD dataset, 1,160 events)
-  fetch_all_pump_data.py            ← Multi-exchange pump scanner + downloader (all 8)
-  fetch_control_data.py             ← Download organic-volatility events as hard negatives
-  scan_multi_exchange.py            ← Live scanner: find new pump candidates on any exchange
+  scan_multi_exchange.py            ← Step 0  — Scan 7 exchanges for new pump candidates (opt-in)
+  fetch_all_pump_data.py            ← Step 1  — Download pump OHLCV (7 exchanges, direct REST)
+  fetch_ardia_pumps.py              ← Step 2  — Binance P&D events (ArdiaD dataset, 322 confirmed)
+  fetch_control_data.py             ← Step 3  — Download organic-volatility events (hard negatives)
 
 Labelling & Enrichment
-  fetch_and_label_tradebook_data.py ← Verify 30% retracement + fetch trade ticks + save peak_bucket
-  reconstruct_orderbook.py          ← OHLCV → Level-2 orderbook (bid/ask price + size)
-  add_orderbook_depth.py            ← Expand all L2 files from 1-level to 10-level depth
+  fetch_and_label_tradebook_data.py ← Step 4  — Verify 30% retracement + fetch trade ticks + peak_bucket
+  reconstruct_orderbook.py          ← Step 5  — OHLCV → Level-2 orderbook (bid/ask price + size)
+  add_orderbook_depth.py            ← Step 6  — Expand all L2 files from 1-level to 10-level depth
 
 Metadata & Market Context
-  tag_peak_buckets.py               ← Compute peak_pct/peak_bucket for reconstructed/ + synthetic/
-  fetch_market_context.py           ← Fetch BTC OHLCV, build _market_ctx.csv, fill market_regime
-  fix_unknown_market_regimes.py     ← Assign normal/uncertain/pumped to files with unknown regime; generate synthetic BTC context
-  migrate_control_to_regimes.py     ← One-time: split control/ → normal/ + uncertain/ based on BTC regime in meta.json
+  tag_peak_buckets.py               ← Step 7  — Compute peak_pct / peak_bucket for all L2 files
+  fetch_market_context.py           ← Step 8  — Fetch BTC OHLCV, build _market_ctx.csv, fill market_regime
+  fix_unknown_market_regimes.py     ← Step 9  — Assign regime to files with unknown market_regime
+  migrate_control_to_regimes.py     ← Step 10 — One-time: split control/ → normal/ + uncertain/
 
 Synthetic Generation
-  generate_global_synthetic.py      ← Type-A: BaseVAE OHLCV → reconstruct → L2
-  generate_direct_synthetic.py      ← Type-B: DirectL2VAE → 3 regimes × 6 buckets + market ctx
-  generate_missing_trades.py        ← Fill trades files for any L2 that has none
+  prepare_l2_training_data.py       ← Step 11 — Vectorise reconstructed/ L2 into .npy for DirectL2VAE
+  train_direct_l2.py                ← Step 12 — Train DirectL2VAE (96-step L2-space VAE, latent dim 64)
+  generate_direct_synthetic.py      ← Step 13 — Type-B: DirectL2VAE → 3 regimes × 6 buckets + trades + ctx
+  generate_missing_trades.py        ← Step 14 — Fill trades files for any L2 that has none
 
-Model Training
-  prepare_l2_training_data.py       ← Vectorise reconstructed/ L2 into data/l2_training_samples.npy
-  train_global_vae.py               ← Train BaseVAE on real OHLCV (Type-A generator)
-  train_direct_l2.py                ← Train DirectL2VAE on reconstructed L2 (Type-B generator)
-  train_pump_detector.py            ← Train PumpDetectorV3 (dual-stream, 18-cell weights)
-
-Validation & Calibration
-  test_pumpable_extractor.py        ← Score all L2 files using PUMPABLE COINS extractor
-  calibrate_threshold.py            ← PR curve + optimal CNN threshold finder (run after training)
-
-Orchestration
-  run_pipeline.py                   ← Runs all steps in order with skip flags
+Model Training & Calibration
+  train_pump_detector.py            ← Step 15 — Train PumpDetectorV3 (dual-stream CNN, 18-cell weights)
+  calibrate_threshold.py            ← Step 16 — PR curve + optimal CNN threshold finder
 ```
 
 ---
 
 ## Data Collection
 
-### `fetch_ardia_pumps.py`
+### `scan_multi_exchange.py`  *(Step 0 — opt-in)*
 
-Downloads 1-minute OHLCV klines from **Binance Data Vision** for every event in the [ArdiaD/PumpDump](https://github.com/ArdiaD/PumpDump) dataset (`data/list_pd_events.csv`, 1,160 Binance events).
+Scans all USDT/BTC pairs across 7 exchanges for pump-and-dump signatures using each exchange's native REST API — no CCXT. Run this when you want to discover new pump events before fetching OHLCV.
 
-- Output: `real/binance/pumps/[SYMBOL]/[SYMBOL]-1m-[DATE].csv`
-- Skips symbols already downloaded
-- Rate-limited (0.3 s between requests, 2 retries)
-- Run this before `fetch_and_label_tradebook_data.py` to validate which events pass the 30% retracement filter
+For each exchange: symbol discovery → fetch up to 200 daily candles per pair → apply 20-candle sliding window with 30% retracement rule.
+
+Events are classified as:
+- `pump` — spike ≥ 5% AND retracement ≥ 30%
+- `volatile_control` — large spike but retracement < 30% (hard negative)
+
+| Exchange | Symbol endpoint | Daily OHLCV endpoint |
+|---|---|---|
+| Binance | `/api/v3/exchangeInfo` | `/api/v3/klines?interval=1d` |
+| Bybit | `/v5/market/instruments-info` | `/v5/market/kline?interval=D` |
+| KuCoin | `/api/v1/symbols` | `/api/v1/market/candles?type=1day` |
+| OKX | `/api/v5/public/instruments` | `/api/v5/market/history-candles?bar=1D` |
+| Gate.io | `/api/v4/spot/currency_pairs` | `/api/v4/spot/candlesticks?interval=1d` |
+| MEXC | `/api/v3/exchangeInfo` | `/api/v3/klines?interval=1d` |
+| Bitget | `/api/v2/spot/public/symbols` | `/api/v2/spot/market/history-candles?granularity=1day` |
+
+- Output: `data/scanned_pumps/[exchange]_pumps.csv` and `data/global_deep_scan_pumps.csv` (combined)
+- Accepts `--exchange` flag to scan a subset (e.g. `--exchange bybit okx`)
+- Output feeds into Steps 1 and 3
 
 ---
 
-### `fetch_all_pump_data.py`
+### `fetch_all_pump_data.py`  *(Step 1)*
 
-Comprehensive multi-exchange fetcher. Reads pump candidates from `data/global_deep_scan_pumps.csv` (produced by `scan_multi_exchange.py`) and downloads the corresponding 1-minute OHLCV using each exchange's native REST API directly — no CCXT.
+Comprehensive multi-exchange pump OHLCV fetcher. Reads pump candidates from `data/global_deep_scan_pumps.csv` (produced by `scan_multi_exchange.py`) and downloads the corresponding 1-minute OHLCV using each exchange's native REST API directly — no CCXT.
 
 | Exchange | Source |
 |---|---|
@@ -84,102 +140,79 @@ Comprehensive multi-exchange fetcher. Reads pump candidates from `data/global_de
 
 ---
 
-### `fetch_control_data.py`
+### `fetch_ardia_pumps.py`  *(Step 2)*
 
-Fetches OHLCV for events that produced a large price spike but **failed** the 30% retracement threshold — these are organic volatility events, not pump-and-dumps. They form the hard-negative control set.
+Downloads 1-minute OHLCV klines from **Binance Data Vision** for every event in the [ArdiaD/PumpDump](https://github.com/ArdiaD/PumpDump) dataset (`data/list_pd_events.csv`, 1,160 Binance events — 322 confirmed successful).
 
-Uses the same direct REST API fetchers as `fetch_all_pump_data.py` — no CCXT. All 7 active exchanges are supported.
-
-- Reads: `data/scanned_pumps/[exchange]_pumps.csv` (rows where `label == "volatile_control"`)
-- Output: `real/[exchange]/control/[SYMBOL]/[SYMBOL]_[DATE]_klines.csv`
-- Accepts `--exchange` flag to fetch one exchange at a time (e.g., `--exchange mexc gateio`)
-- After fetching, run `fetch_market_context.py` to assign market regime, then `migrate_control_to_regimes.py` to sort files into `normal/` or `uncertain/` subfolders
+- Output: `real/binance/pumps/[SYMBOL]/[SYMBOL]-1m-[DATE].csv`
+- Skips symbols already downloaded
+- Rate-limited (0.3 s between requests, 2 retries)
 
 ---
 
-### `scan_multi_exchange.py`
+### `fetch_control_data.py`  *(Step 3)*
 
-Scans all USDT and BTC pairs across 7 exchanges for pump-and-dump signatures using each exchange's native REST API directly — no CCXT.
+Fetches OHLCV for events that produced a large price spike but **failed** the 30% retracement threshold — organic volatility events that form the hard-negative control set.
 
-For each exchange the script performs two steps:
-1. **Symbol discovery** — calls the exchange's market-info endpoint to get the full list of active USDT/BTC spot pairs
-2. **Daily OHLCV scan** — fetches up to 200 daily candles per symbol and applies a sliding 20-candle window with the 30% retracement rule
+Uses the same direct REST API fetchers as `fetch_all_pump_data.py` — no CCXT. All 7 exchanges supported.
 
-Events are classified as:
-- `pump` — spike ≥ 5% AND retracement ≥ 30% → goes to `real/[exchange]/pumps/` after OHLCV download
-- `volatile_control` — large spike but retracement < 30% → goes to `real/[exchange]/control/` as a hard negative
-
-| Exchange | Symbol endpoint | Daily OHLCV endpoint |
-|---|---|---|
-| Binance | `/api/v3/exchangeInfo` | `/api/v3/klines?interval=1d` |
-| Bybit | `/v5/market/instruments-info` | `/v5/market/kline?interval=D` |
-| KuCoin | `/api/v1/symbols` | `/api/v1/market/candles?type=1day` |
-| OKX | `/api/v5/public/instruments` | `/api/v5/market/history-candles?bar=1D` (paginated) |
-| Gate.io | `/api/v4/spot/currency_pairs` | `/api/v4/spot/candlesticks?interval=1d` |
-| MEXC | `/api/v3/exchangeInfo` | `/api/v3/klines?interval=1d` |
-| Bitget | `/api/v2/spot/public/symbols` | `/api/v2/spot/market/history-candles?granularity=1day` |
-
-- Output: `data/scanned_pumps/[exchange]_pumps.csv` per exchange and `data/global_deep_scan_pumps.csv` combined
-- Accepts `--exchange` flag to scan a subset (e.g. `--exchange bybit okx`)
-- Output feeds into `fetch_all_pump_data.py` and `fetch_control_data.py`
+- Reads: `data/scanned_pumps/[exchange]_pumps.csv` (rows where `label == "volatile_control"`)
+- Output: `real/[exchange]/control/[SYMBOL]/[SYMBOL]_[DATE]_klines.csv`
+- Accepts `--exchange` flag
 
 ---
 
 ## Labelling & Enrichment
 
-### `fetch_and_label_tradebook_data.py`
+### `fetch_and_label_tradebook_data.py`  *(Step 4)*
 
 Verifies pump labels and enriches confirmed events with real trade ticks — two operations in a single pass over `real/`.
 
 **Label step** — applies pump confirmation criteria to every event in `real/pumps/`:
-1. Price spike >= **5%** from the initial open
-2. Retracement >= **30%** from peak back toward the pre-pump price
+1. Price spike ≥ **5%** from the initial open
+2. Retracement ≥ **30%** from peak back toward the pre-pump price
 
-Events that pass stay in `pumps/`. Events that fail (organic volatility) are moved to `normal/` or `uncertain/` depending on market regime during the event. A report is written to `data/labeling_report.csv`.
+Events that pass stay in `pumps/`. Events that fail are moved to `normal/` or `uncertain/` depending on BTC market regime. A report is written to `data/labeling_report.csv`.
 
-**Enrich step** — for each confirmed pump, immediately fetches real trade ticks if a free archive is available:
+**Enrich step** — for each confirmed pump, fetches real trade ticks where available:
 - **Binance** → `data.binance.vision/data/spot/daily/trades/` (full history)
 - **Bybit** → `public.bybit.com/trading/` (rolling ~90 days)
 - Other exchanges: no free source — ticks remain OHLCV-derived
 
-Ticks are saved to `real/[exchange]/pumps/[symbol]/[SYM]-trades-[DATE].csv` and also upgrade the matching `reconstructed/` trades file.
-
 ```
-python scripts/fetch_and_label_tradebook_data.py                        # label + fetch ticks (binance + bybit)
-python scripts/fetch_and_label_tradebook_data.py --skip-tradebook       # label only
-python scripts/fetch_and_label_tradebook_data.py --exchanges binance    # label + fetch binance only
-python scripts/fetch_and_label_tradebook_data.py --within-days 90       # skip bybit dates older than 90 days
+python scripts/fetch_and_label_tradebook_data.py
+python scripts/fetch_and_label_tradebook_data.py --skip-tradebook
+python scripts/fetch_and_label_tradebook_data.py --exchanges binance
+python scripts/fetch_and_label_tradebook_data.py --within-days 90
 ```
 
 ---
 
-### `reconstruct_orderbook.py`
+### `reconstruct_orderbook.py`  *(Step 5)*
 
-Converts 1-minute OHLCV klines into synthetic Level-2 orderbook snapshots using the [ohlcv-to-orderbook](https://github.com/nickvdyck/ohlcv-to-orderbook) model.
+Converts 1-minute OHLCV klines into synthetic Level-2 orderbook snapshots using the [ohlcv-to-orderbook](https://pypi.org/project/ohlcv-to-orderbook/) library.
 
 - Input: `real/[exchange]/[regime]/[SYMBOL]/[SYMBOL]_*_klines.csv`
 - Output: `reconstructed/[exchange]/[regime]/[SYMBOL]/[SYMBOL]_*_L2.csv` — columns: `bid_price, ask_price, bid_size, ask_size`
 - Also generates a paired `*_trades.csv` using the OHLCV buy-ratio formula: `buy_ratio = (close − low) / (high − low + ε)`
-- This is the primary method for producing L2 data when real orderbook snapshots are unavailable
 
 ---
 
-### `add_orderbook_depth.py`
+### `add_orderbook_depth.py`  *(Step 6)*
 
 Expands every L2 file from single-level (bid/ask level 1 only) to **10-level orderbook depth** by simulating realistic price ladders and size distributions.
 
 - Adds columns: `bid_price_2..10`, `bid_size_2..10`, `ask_price_2..10`, `ask_size_2..10`
-- Run once after any batch of new L2 files are created
+- Price step per level grows with depth; bid/ask size decay is asymmetric under buy pressure
 - Safe to re-run — skips files that already have depth columns
-- Applied to 8,582 files in Phase 3b
 
 ---
 
 ## Metadata & Market Context
 
-### `tag_peak_buckets.py`
+### `tag_peak_buckets.py`  *(Step 7)*
 
-Scans every `*_L2.csv` in `reconstructed/` and `synthetic/` and writes a `*_meta.json` alongside each file (skipping files that already have one). Computes the peak price increase and retracement from the mid-price curve, then assigns a `peak_bucket`:
+Scans every `*_L2.csv` in `reconstructed/` and `synthetic/` and writes a `*_meta.json` alongside each file (skips files that already have one). Computes the peak price increase and retracement, then assigns `peak_pct`, `peak_idx`, and a `peak_bucket`:
 
 | Bucket | Peak increase range |
 |---|---|
@@ -190,8 +223,6 @@ Scans every `*_L2.csv` in `reconstructed/` and `synthetic/` and writes a `*_meta
 | major | 40 – 50% |
 | extreme | 50%+ |
 
-Sets `market_regime = "unknown"` — run `fetch_market_context.py` next to fill it in.
-
 ```
 python scripts/tag_peak_buckets.py             # tag all untagged files
 python scripts/tag_peak_buckets.py --overwrite # re-tag everything
@@ -199,199 +230,144 @@ python scripts/tag_peak_buckets.py --overwrite # re-tag everything
 
 ---
 
-### `fetch_market_context.py`
+### `fetch_market_context.py`  *(Step 8)*
 
 For every event in `real/` and `reconstructed/`, downloads the BTCUSDT 1-minute kline for that date from Binance Data Vision (cached in `data/market_context/`), then:
 
-1. Classifies the market's behaviour during that window as `normal` / `uncertain` / `pumped` (using BTC OHLCV as the market proxy)
-2. Builds a 6-feature market context sequence (`bid_price, ask_price, bid_size, ask_size, buy_ratio, aggressor_imbalance`) derived from BTC OHLCV
+1. Classifies the market's behaviour as `normal` / `uncertain` / `pumped`
+2. Builds a 6-feature market context sequence derived from BTC OHLCV
 3. Saves it as `*_market_ctx.csv` alongside the coin's L2 file
-4. Updates `market_regime` and `background_volatility` in the matching `*_meta.json`
+4. Updates `market_regime` and `background_volatility` in `*_meta.json`
 
 Market regime thresholds: < 3% move = normal · 3–8% without retracement = uncertain · ≥ 5% spike with ≥ 20% retracement = pumped.
-
-Background volatility is classified from the std dev of 1-min close-price returns: calm < 0.10%/bar · volatile > 0.30%/bar · normal in between.
 
 ```
 python scripts/fetch_market_context.py
 python scripts/fetch_market_context.py --exchanges binance kucoin
-python scripts/fetch_market_context.py --overwrite   # rebuild existing ctx files
+python scripts/fetch_market_context.py --overwrite
 ```
 
 ---
 
-### `fix_unknown_market_regimes.py`
+### `fix_unknown_market_regimes.py`  *(Step 9)*
 
-Fixes all `*_meta.json` files across `reconstructed/` and `synthetic/` where `market_regime` was left as `"unknown"` (caused by failed BTC kline downloads for future-dated events or older Type-A synthetic files).
+Fixes all `*_meta.json` files where `market_regime` was left as `"unknown"`. Assigns one of 9 combinations (regime × background volatility) in round-robin, and generates a synthetic `*_market_ctx.csv` for each fixed file.
 
-- Assigns one of 9 combinations (regime × background volatility) in round-robin across all unknown files — cycles through all 9 evenly
-- Generates a synthetic `*_market_ctx.csv` for each fixed file using statistical BTC price/volume profiles per regime
-- Regime profiles: `normal` = low-noise drift, balanced bid/ask; `uncertain` = moderate drift with spikes; `pumped` = sharp spike with 40–70% retracement
 - Safe to re-run — only touches files where `market_regime == "unknown"`
-- Fixed 4,470 files total: 3,649 reconstructed + 821 synthetic
-
-```
-python scripts/fix_unknown_market_regimes.py
-```
 
 ---
 
-### `migrate_control_to_regimes.py`
+### `migrate_control_to_regimes.py`  *(Step 10)*
 
 One-time migration that splits the legacy `control/` directory into `normal/` and `uncertain/` based on the market regime stored in each symbol's `*_meta.json`.
 
-**REGIME_MAP** (market regime → destination folder):
-- `normal` → `normal/`
-- `uncertain` → `uncertain/`
-- `pumped` → `uncertain/` (coin followed BTC momentum, not genuine pump — still a soft negative)
-- `unknown` → `normal/` (fallback)
-
-- Supports `--dry-run` (preview moves without touching files) and `--dirs` (specify tiers to migrate)
-- Applied to 4,840 symbol dirs across `reconstructed/` and `synthetic/`; `real/` migrated separately
-
-```
-python scripts/migrate_control_to_regimes.py --dry-run          # preview
-python scripts/migrate_control_to_regimes.py                    # apply to reconstructed/ + synthetic/
-python scripts/migrate_control_to_regimes.py --dirs real        # apply to real/ only
-```
+- `normal` market regime → `normal/`
+- `uncertain` or `pumped` market regime → `uncertain/`
+- Supports `--dry-run` and `--dirs` flags
 
 ---
 
 ## Synthetic Generation
 
-### `generate_global_synthetic.py`
+### `prepare_l2_training_data.py`  *(Step 11)*
 
-**Type-A synthetic generator.** Uses the trained `BaseVAE` (OHLCV-space, 24-step windows, latent dim 32) to sample new OHLCV sequences, then passes them through `reconstruct_orderbook.py` to produce L2 files.
+Vectorises all `reconstructed/` L2 files into a single NumPy array for training the `DirectL2VAE`.
 
-- Generates 100 samples per exchange (50 pump, 50 control) × exchanges = 800+ files
-- Output: `synthetic/[exchange]/[regime]/[symbol]/[symbol]_synthetic_L2.csv`
-- Requires `models/global_vae_v1.pth` and `models/global_scaler_v1.pkl`
-- Type-A synthetic has no paired trades file (neutral fill applied during training)
+- Reads 4 features: `bid_price, ask_price, bid_size, ask_size` — first 96 timesteps per file
+- Applies StandardScaler normalisation
+- Output: `data/l2_training_samples.npy` and `models/l2_scaler.pkl`
 
 ---
 
-### `generate_direct_synthetic.py`
+### `train_direct_l2.py`  *(Step 12)*
 
-**Type-B synthetic generator.** Uses the trained `DirectL2VAE` (L2-space, 96-step windows, latent dim 64) to generate orderbook sequences **directly** — no OHLCV intermediate step.
+Trains the **DirectL2VAE** — the generative model that operates directly in L2 orderbook space.
 
-Each sample is tagged with a **coin regime** (pump/control), a **market regime** (normal/uncertain/pumped), and a **peak bucket** (micro through extreme). This covers the full 3×3 coin×market matrix Andy defined.
+- Architecture: 1D-Convolutional VAE — 3× Conv1d encoder (4→128 channels), 64-dim latent space, 3× ConvTranspose1d decoder → `[B, 96, 4]`
+- Trains on `data/l2_training_samples.npy` (prepared by Step 11)
+- 100 epochs, batch size 32, Adam optimizer
+- Saves weights to `models/direct_l2_vae_v1.pth`
+
+---
+
+### `generate_direct_synthetic.py`  *(Step 13)*
+
+**Type-B synthetic generator.** Uses the trained `DirectL2VAE` to generate 10-level orderbook sequences **directly** — no OHLCV intermediate step.
+
+Each sample is tagged with a **coin regime** (pump/control), a **market regime** (normal/uncertain/pumped), and a **peak bucket** (micro→extreme), covering the full 3×3 coin×market matrix.
 
 Per sample, 4 files are saved:
 - `*_direct_L2.csv` — coin orderbook (96 timesteps, 10-level depth)
-- `*_trades.csv` — coin tradebook with pump-phase buy/sell logic
-- `*_market_ctx.csv` — synthetic BTC context for the 3 market regime types
+- `*_trades.csv` — coin tradebook with pump-phase buy/sell logic (80% buys before peak, 25% after)
+- `*_market_ctx.csv` — synthetic BTC context for the assigned market regime
 - `*_meta.json` — `coin_regime`, `market_regime`, `peak_bucket`, `peak_pct`, `peak_idx`
 
-Pump sample distribution: 6 peak buckets × 3 market regimes = **18 cells**, cycled evenly across 54 pump samples per exchange.
-Control sample distribution: 3 market regimes × 17 each = 51 control samples per exchange.
+**Asymmetric bid/ask pump injection:**
+- Pre-peak: `bid_size ×(1 + 4×intensity×gauss)`, `ask_size ×(1 − 0.3×intensity×gauss)` — buyers flood in, asks thin out
+- Post-peak: `ask_size ×(1 + 5×intensity×gauss)`, `bid_size ×(1 − 0.2×intensity×gauss)` — sellers dump, bids retreat
 
-- Total: 105 samples × 8 exchanges = **840 files**
+- 105 samples per exchange (54 pump across 18 cells, 51 control) × 8 exchanges = **840 files**
 - Requires `models/direct_l2_vae_v1.pth` and `models/l2_scaler.pkl`
 
 ---
 
-### `generate_missing_trades.py`
+### `generate_missing_trades.py`  *(Step 14)*
 
 Scans all L2 files across `reconstructed/` and `synthetic/` and creates a paired `*_trades.csv` for any file that is missing one.
 
-- Uses the OHLCV buy-ratio formula as the fallback: `buy_ratio = (close − low) / (high − low + ε)`
-- Ensures 100% trades coverage across the full dataset so the CNN can always read `buy_ratio` and `aggressor_imbalance` features
+- Uses the OHLCV buy-ratio formula: `buy_ratio = (close − low) / (high − low + ε)`
+- Ensures 100% trades coverage so the CNN always has `buy_ratio` and `aggressor_imbalance` features
 - Safe to re-run — skips files that already have a trades file
 
 ---
 
-## Model Training
+## Model Training & Calibration
 
-### `prepare_l2_training_data.py`
-
-Vectorises all `reconstructed/` L2 files into a single NumPy array for training the `DirectL2VAE`.
-
-- Reads 4 features: `bid_price, ask_price, bid_size, ask_size` — first 96 timesteps of each file
-- Applies StandardScaler normalization
-- Output: `data/l2_training_samples.npy` and `models/l2_scaler.pkl`
-- Run this before `train_direct_l2.py` whenever new reconstructed files have been added
-
----
-
-### `train_global_vae.py`
-
-Trains the **BaseVAE** — the Type-A generative model that operates in OHLCV space.
-
-- Architecture: 24-step × 5-feature input, latent dim 32
-- Trains on all OHLCV kline files in `real/`
-- Saves weights to `models/global_vae_v1.pth` and scaler to `models/global_scaler_v1.pkl`
-- Note: The BaseVAE is the older generator. The `DirectL2VAE` (Type-B) produces higher-quality L2 sequences. Both are retained.
-
----
-
-### `train_direct_l2.py`
-
-Trains the **DirectL2VAE** — the Type-B generative model that operates directly in L2 orderbook space.
-
-- Architecture: 1D-Convolutional VAE, 96-step × 4-feature input, latent dim 64
-- Trains on `data/l2_training_samples.npy` (prepared by `prepare_l2_training_data.py`)
-- Saves weights to `models/direct_l2_vae_v1.pth`
-- 100 epochs, batch size 32, Adam optimizer
-
----
-
-### `train_pump_detector.py`
+### `train_pump_detector.py`  *(Step 15)*
 
 Trains **PumpDetectorV3** — the dual-stream, dual-output pump detection model.
 
-**Architecture:** Two independent 3-block 1D-CNN towers (coin stream + market context stream), each producing a 128-dim feature vector. These are concatenated → shared trunk (256→128) → two independent heads:
+**Architecture:** Two independent 3-block 1D-CNN towers (coin stream + market stream) → shared trunk (256→128) → two heads:
 
-| Stream | Input | Source |
-|---|---|---|
-| Coin | `[96, 6]` — bid/ask price+size, buy_ratio, agg_imb | `*_L2.csv` + `*_trades.csv` |
-| Market | `[96, 6]` — same schema for BTC context | `*_market_ctx.csv` (neutral fill if missing) |
-
-**Two output heads:**
-
-| Head | Output | Loss | Trained on |
+| Head | Output | Loss | When |
 |---|---|---|---|
-| `cls_head` | `pump_prob` — sigmoid pump probability [0, 1] | BCELoss | All samples |
-| `reg_head` | `peak_pos` — sigmoid peak position `peak_idx / 96` [0, 1] | MSELoss (pump samples only) | Pump samples where `peak_idx` is known (synthetic data + `tag_peak_buckets.py` output) |
+| `cls_head` | `pump_prob` — sigmoid [0, 1] | BCELoss | All samples |
+| `reg_head` | `peak_pos` = `peak_idx / 96` — sigmoid [0, 1] | MSELoss | Pump samples only |
 
 Combined loss: `total = BCE + 0.3 × MSE`
 
-**Per-exchange pump window cap:** Maximum 5,000 pump windows per exchange. Prevents Gate.io (which historically contributed 32% of all pump windows) from dominating the training distribution and causing AUC instability.
+**Per-exchange pump cap:** 5,000 windows per exchange. Prevents Gate.io (historically 32% of pump windows) from dominating training and causing AUC oscillation.
 
-**Peak target loading (priority order):**
-1. `peak_pct` from `*_meta.json` (written by `tag_peak_buckets.py`)
-2. `peak_idx / 96` from `*_meta.json` (written by `generate_direct_synthetic.py`)
-3. Bucket centre derived from `peak_bucket` (written by `tag_peak_buckets.py`)
-4. 0.5 neutral fallback (masked out by pump_mask — no gradient contribution for control)
+**Metrics reported:**
+- Best validation AUC (best checkpoint across all epochs)
+- Mean validation AUC ± std dev (stability across all 60 epochs)
+- Zero-shot AUC on Bybit + OKX (never seen during training)
+- Peak timing MAE in candles
 
-**18-cell sample weighting** — each training window is weighted by its position in the coin × market regime × background volatility matrix. A pump during a calm, flat BTC market is the clearest manipulation signal (weight 4.0); a spike when BTC is also pumping in a volatile market is the least distinctive (weight 1.0):
+**18-cell sample weighting** — each window is weighted by its coin × market regime × background volatility cell:
 
-| Coin \ Market / Volatility | Normal·Calm | Normal·Normal | Normal·Volatile | Uncertain·Calm | Uncertain·Normal | Uncertain·Volatile | Pumped·Calm | Pumped·Normal | Pumped·Volatile |
-|---|---|---|---|---|---|---|---|---|---|
-| **Pump** | **4.0** | 3.0 | 2.0 | 2.5 | 2.0 | 1.5 | 1.5 | 1.0 | 1.0 |
-| **Control** | 3.5 | 2.5 | 1.5 | 2.0 | 1.5 | 1.0 | 1.5 | 1.0 | 1.0 |
+| Coin \ Market / Volatility | Normal·Calm | Normal·Normal | Normal·Volatile | Uncertain | Pumped |
+|---|---|---|---|---|---|
+| **Pump** | **4.0** | 3.0 | 2.0 | 2.5→1.5 | 1.5→1.0 |
+| **Control** | 3.5 | 2.5 | 1.5 | 2.0→1.0 | 1.5→1.0 |
 
-- Scans both `reconstructed/` and `synthetic/` for training windows
 - Train exchanges: Binance, KuCoin, MEXC, Gate.io, Bitget
-- Zero-shot test exchanges (2): Bybit, OKX (never seen during training)
+- Zero-shot test: Bybit, OKX
 - Saves to `models/pump_detector_v3.pth`
-- Training output includes peak regression MAE in candles alongside classification AUC
 
-After training, run `calibrate_threshold.py` to find the optimal CNN threshold on the zero-shot test set.
-
-See `detector.md` (project root) for inference examples — `forward()` now returns `(pump_prob, peak_pos)` tuple.
+`forward()` returns `(pump_prob, peak_pos)` — see `detector.md` for inference examples.
 
 ---
 
-### `calibrate_threshold.py`
+### `calibrate_threshold.py`  *(Step 16)*
 
-Finds the optimal `CNN_THRESHOLD` for the production cascade using precision-recall curves on the zero-shot test set (Bybit + OKX — exchanges never seen during training).
+Finds the optimal `CNN_THRESHOLD` for the production cascade using precision-recall curves on the zero-shot test set (Bybit + OKX).
 
-**What it does:**
-1. Loads `models/pump_detector_v3.pth` and runs inference on Bybit + OKX data
+1. Loads `models/pump_detector_v3.pth` and runs inference on the calibration exchanges
 2. Plots the full precision-recall curve and computes F1 at every threshold point
 3. Prints a threshold table (precision / recall / F1 at 0.05 steps from 0.30 to 0.95)
-4. Identifies the threshold that maximises F1 and recommends it for `live/config.py`
-5. Saves the PR curve plot to `models/pr_curve.png`
+4. Identifies the threshold that maximises F1
+5. Saves the PR curve to `models/pr_curve.png`
 
 ```
 python scripts/calibrate_threshold.py                            # Bybit + OKX (default)
@@ -399,54 +375,7 @@ python scripts/calibrate_threshold.py --exchanges bybit          # Bybit only
 python scripts/calibrate_threshold.py --no-plot                  # skip matplotlib output
 ```
 
-The recommended threshold replaces `CNN_THRESHOLD = 0.65` in `live/config.py`.
-
----
-
-## Validation
-
-### `test_pumpable_extractor.py`
-
-Scores all L2 files using the `PumpableCoinExtractor` from the PUMPABLE COINS module.
-
-- Reads up to 10 orderbook levels and the paired `*_trades.csv`
-- Scores based on: orderbook imbalance (50%), market depth/impact (30%), spread (20%)
-- Writes results to `data/pumpable_scores.csv`
-- Used to verify that pump samples score higher than control samples (discrimination check)
-- Results: real data 1.15× pump/control ratio; synthetic data ~1.02× (pump cycle averages to near-neutral over the full 96-step window)
-
----
-
-## Orchestration
-
-### `run_pipeline.py`
-
-Runs all pipeline steps in sequence after new data is fetched. Each step calls the corresponding script as a subprocess and aborts if any step fails.
-
-```
-python scripts/run_pipeline.py                    # run all steps
-python scripts/run_pipeline.py --skip-fetch       # skip data download (already done)
-python scripts/run_pipeline.py --skip-label       # skip retracement labelling
-python scripts/run_pipeline.py --skip-reconstruct # skip L2 reconstruction + depth expansion
-python scripts/run_pipeline.py --skip-synthetic   # skip VAE generation steps
-python scripts/run_pipeline.py --train-only       # run CNN training only
-```
-
-Step order:
-1. `fetch_all_pump_data.py` — pump OHLCV (7 exchanges via direct REST)
-2. `fetch_control_data.py` — volatile-control OHLCV (7 exchanges)
-3. `fetch_and_label_tradebook_data.py`
-4. `reconstruct_orderbook.py`
-5. `add_orderbook_depth.py`
-6. `tag_peak_buckets.py`
-7. `fetch_market_context.py`
-8. `fix_unknown_market_regimes.py`
-9. `migrate_control_to_regimes.py`
-10. `prepare_l2_training_data.py`
-11. `train_direct_l2.py`
-12. `generate_direct_synthetic.py`
-13. `generate_missing_trades.py`
-14. `train_pump_detector.py`
+When called from `main.py` (Step 16), `--no-plot` is passed automatically — the plot is saved to disk without opening a window. The recommended threshold replaces `CNN_THRESHOLD` in `live/config.py`.
 
 ---
 
@@ -454,23 +383,19 @@ Step order:
 
 | File | Produced by | Used by |
 |---|---|---|
-| `models/global_vae_v1.pth` | `train_global_vae.py` | `generate_global_synthetic.py` |
-| `models/global_scaler_v1.pkl` | `train_global_vae.py` | `generate_global_synthetic.py` |
-| `models/direct_l2_vae_v1.pth` | `train_direct_l2.py` | `generate_direct_synthetic.py` |
-| `models/l2_scaler.pkl` | `prepare_l2_training_data.py` | `train_direct_l2.py`, `generate_direct_synthetic.py` |
-| `models/pump_detector_v3.pth` | `train_pump_detector.py` | Live inference — `PumpDetectorV3(x_coin, x_market)` returns `(pump_prob, peak_pos)` |
-| `models/pr_curve.png` | `calibrate_threshold.py` | Visual reference — PR curve on zero-shot test set |
+| `models/direct_l2_vae_v1.pth` | `train_direct_l2.py` (Step 12) | `generate_direct_synthetic.py` (Step 13) |
+| `models/l2_scaler.pkl` | `prepare_l2_training_data.py` (Step 11) | Steps 12, 13 |
+| `models/pump_detector_v3.pth` | `train_pump_detector.py` (Step 15) | Live inference — returns `(pump_prob, peak_pos)` |
+| `models/pr_curve.png` | `calibrate_threshold.py` (Step 16) | Visual reference — PR curve on zero-shot test set |
 
-The `models/` folder contains only source `.py` files until the training pipeline runs. All `.pth`, `.pkl`, and `.joblib` artefacts are generated by the scripts and are not committed to the repository.
+The `models/` folder contains only source `.py` files until the pipeline runs. All `.pth`, `.pkl`, and generated artefacts are created at runtime and are not committed to the repository.
 
 ---
 
 ## Prerequisites
 
 ```
-pip install torch numpy pandas scikit-learn requests joblib
+pip install torch numpy pandas scikit-learn requests joblib ohlcv-to-orderbook matplotlib
 ```
 
-The `ohlcv-to-orderbook` binary must be on PATH for `reconstruct_orderbook.py`.
-
-The `PUMPABLE COINS` project folder must be at the same directory level as this project for `test_pumpable_extractor.py`.
+The `ohlcv-to-orderbook` package must be installed for `reconstruct_orderbook.py` (Step 5).
