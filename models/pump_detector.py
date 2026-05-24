@@ -73,21 +73,32 @@ class PumpDetectorV3(nn.Module):
     Inputs:
       x_coin   [Batch, 96, num_coin_features]    — coin orderbook + trade flow
       x_market [Batch, 96, num_market_features]  — BTC/market context (same feature schema)
-    Output:
-      [Batch]  scalar in [0, 1]  — pump probability
+    Outputs:
+      pump_prob  [Batch]  scalar in [0, 1]  — pump probability (classification head)
+      peak_pos   [Batch]  scalar in [0, 1]  — normalised peak position peak_idx/96
+                                              (regression head; trained on synthetic data)
     """
 
     def __init__(self, num_coin_features: int = 6, num_market_features: int = 6):
         super().__init__()
         self.coin_stream   = FeatureExtractor(num_coin_features)    # → [B, 128]
         self.market_stream = FeatureExtractor(num_market_features)  # → [B, 128]
-        self.classifier    = nn.Sequential(
-            nn.Linear(256, 64), nn.ReLU(), nn.Dropout(0.3),
-            nn.Linear(64, 1),   nn.Sigmoid(),
+        # Shared trunk: merges coin + market representations
+        self.trunk = nn.Sequential(
+            nn.Linear(256, 128), nn.ReLU(), nn.Dropout(0.3),
         )
+        # Classification head — is this a pump?
+        self.cls_head = nn.Sequential(nn.Linear(128, 1), nn.Sigmoid())
+        # Regression head — where is the peak within the 96-step window?
+        self.reg_head = nn.Sequential(nn.Linear(128, 1), nn.Sigmoid())
 
-    def forward(self, x_coin: torch.Tensor, x_market: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x_coin: torch.Tensor, x_market: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         coin_feat   = self.coin_stream(x_coin)      # [B, 128]
         market_feat = self.market_stream(x_market)  # [B, 128]
         combined    = torch.cat([coin_feat, market_feat], dim=1)  # [B, 256]
-        return self.classifier(combined).squeeze(-1)
+        trunk       = self.trunk(combined)                        # [B, 128]
+        pump_prob   = self.cls_head(trunk).squeeze(-1)            # [B]
+        peak_pos    = self.reg_head(trunk).squeeze(-1)            # [B] in [0, 1]
+        return pump_prob, peak_pos
