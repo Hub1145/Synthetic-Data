@@ -41,8 +41,9 @@ Model Training
   train_direct_l2.py                ← Train DirectL2VAE on reconstructed L2 (Type-B generator)
   train_pump_detector.py            ← Train PumpDetectorV3 (dual-stream, 18-cell weights)
 
-Validation
+Validation & Calibration
   test_pumpable_extractor.py        ← Score all L2 files using PUMPABLE COINS extractor
+  calibrate_threshold.py            ← PR curve + optimal CNN threshold finder (run after training)
 
 Orchestration
   run_pipeline.py                   ← Runs all steps in order with skip flags
@@ -336,14 +337,31 @@ Trains the **DirectL2VAE** — the Type-B generative model that operates directl
 
 ### `train_pump_detector.py`
 
-Trains **PumpDetectorV3** — the dual-stream pump detection model.
+Trains **PumpDetectorV3** — the dual-stream, dual-output pump detection model.
 
-**Architecture:** Two independent 3-block 1D-CNN towers (coin stream + market context stream), each producing a 128-dim feature vector. These are concatenated → shared MLP → sigmoid output.
+**Architecture:** Two independent 3-block 1D-CNN towers (coin stream + market context stream), each producing a 128-dim feature vector. These are concatenated → shared trunk (256→128) → two independent heads:
 
 | Stream | Input | Source |
 |---|---|---|
 | Coin | `[96, 6]` — bid/ask price+size, buy_ratio, agg_imb | `*_L2.csv` + `*_trades.csv` |
 | Market | `[96, 6]` — same schema for BTC context | `*_market_ctx.csv` (neutral fill if missing) |
+
+**Two output heads:**
+
+| Head | Output | Loss | Trained on |
+|---|---|---|---|
+| `cls_head` | `pump_prob` — sigmoid pump probability [0, 1] | BCELoss | All samples |
+| `reg_head` | `peak_pos` — sigmoid peak position `peak_idx / 96` [0, 1] | MSELoss (pump samples only) | Pump samples where `peak_idx` is known (synthetic data + `tag_peak_buckets.py` output) |
+
+Combined loss: `total = BCE + 0.3 × MSE`
+
+**Per-exchange pump window cap:** Maximum 5,000 pump windows per exchange. Prevents Gate.io (which historically contributed 32% of all pump windows) from dominating the training distribution and causing AUC instability.
+
+**Peak target loading (priority order):**
+1. `peak_pct` from `*_meta.json` (written by `tag_peak_buckets.py`)
+2. `peak_idx / 96` from `*_meta.json` (written by `generate_direct_synthetic.py`)
+3. Bucket centre derived from `peak_bucket` (written by `tag_peak_buckets.py`)
+4. 0.5 neutral fallback (masked out by pump_mask — no gradient contribution for control)
 
 **18-cell sample weighting** — each training window is weighted by its position in the coin × market regime × background volatility matrix. A pump during a calm, flat BTC market is the clearest manipulation signal (weight 4.0); a spike when BTC is also pumping in a volatile market is the least distinctive (weight 1.0):
 
@@ -353,11 +371,35 @@ Trains **PumpDetectorV3** — the dual-stream pump detection model.
 | **Control** | 3.5 | 2.5 | 1.5 | 2.0 | 1.5 | 1.0 | 1.5 | 1.0 | 1.0 |
 
 - Scans both `reconstructed/` and `synthetic/` for training windows
-- Train exchanges: Binance, KuCoin, MEXC, Gate.io, Bitget (+ Huobi historical data on disk)
-- Zero-shot test exchanges (2): Bybit, OKX
+- Train exchanges: Binance, KuCoin, MEXC, Gate.io, Bitget
+- Zero-shot test exchanges (2): Bybit, OKX (never seen during training)
 - Saves to `models/pump_detector_v3.pth`
+- Training output includes peak regression MAE in candles alongside classification AUC
 
-See `detector.md` (project root) for inference examples (use `PumpDetectorV3` with both coin and market windows).
+After training, run `calibrate_threshold.py` to find the optimal CNN threshold on the zero-shot test set.
+
+See `detector.md` (project root) for inference examples — `forward()` now returns `(pump_prob, peak_pos)` tuple.
+
+---
+
+### `calibrate_threshold.py`
+
+Finds the optimal `CNN_THRESHOLD` for the production cascade using precision-recall curves on the zero-shot test set (Bybit + OKX — exchanges never seen during training).
+
+**What it does:**
+1. Loads `models/pump_detector_v3.pth` and runs inference on Bybit + OKX data
+2. Plots the full precision-recall curve and computes F1 at every threshold point
+3. Prints a threshold table (precision / recall / F1 at 0.05 steps from 0.30 to 0.95)
+4. Identifies the threshold that maximises F1 and recommends it for `live/config.py`
+5. Saves the PR curve plot to `models/pr_curve.png`
+
+```
+python scripts/calibrate_threshold.py                            # Bybit + OKX (default)
+python scripts/calibrate_threshold.py --exchanges bybit          # Bybit only
+python scripts/calibrate_threshold.py --no-plot                  # skip matplotlib output
+```
+
+The recommended threshold replaces `CNN_THRESHOLD = 0.65` in `live/config.py`.
 
 ---
 
@@ -416,7 +458,10 @@ Step order:
 | `models/global_scaler_v1.pkl` | `train_global_vae.py` | `generate_global_synthetic.py` |
 | `models/direct_l2_vae_v1.pth` | `train_direct_l2.py` | `generate_direct_synthetic.py` |
 | `models/l2_scaler.pkl` | `prepare_l2_training_data.py` | `train_direct_l2.py`, `generate_direct_synthetic.py` |
-| `models/pump_detector_v3.pth` | `train_pump_detector.py` | Inference — `PumpDetectorV3(x_coin, x_market)` (see `detector.md`) |
+| `models/pump_detector_v3.pth` | `train_pump_detector.py` | Live inference — `PumpDetectorV3(x_coin, x_market)` returns `(pump_prob, peak_pos)` |
+| `models/pr_curve.png` | `calibrate_threshold.py` | Visual reference — PR curve on zero-shot test set |
+
+The `models/` folder contains only source `.py` files until the training pipeline runs. All `.pth`, `.pkl`, and `.joblib` artefacts are generated by the scripts and are not committed to the repository.
 
 ---
 

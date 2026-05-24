@@ -3,7 +3,9 @@ CNN PumpDetector v3 training script — dual-stream (coin + market context).
 
 Architecture: PumpDetectorV3
   - Separate 3-block 1D-CNN towers for coin L2 and market context (BTC)
-  - Towers concatenated → shared MLP classifier → sigmoid pump probability
+  - Towers → shared trunk (256→128) → two heads:
+      cls_head  sigmoid pump probability          (BCE loss)
+      reg_head  sigmoid peak_pos = peak_idx/96   (MSE loss, pump samples only)
   - Captures the full 3×3 coin×market regime matrix
 
 Input per sample:
@@ -53,23 +55,25 @@ from models.pump_detector import PumpDetectorV3
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-RECONSTRUCTED_BASE = "reconstructed"
-SYNTHETIC_BASE     = "synthetic"
-MODEL_SAVE_PATH    = "models/pump_detector_v3.pth"
-TIMESTEPS          = 96
+RECONSTRUCTED_BASE  = "reconstructed"
+SYNTHETIC_BASE      = "synthetic"
+MODEL_SAVE_PATH     = "models/pump_detector_v3.pth"
+TIMESTEPS           = 96
 
 L2_FEATURES    = ['bid_price', 'ask_price', 'bid_size', 'ask_size']
 TRADE_FEATURES = ['buy_ratio', 'aggressor_imbalance']
 ALL_FEATURES   = L2_FEATURES + TRADE_FEATURES
 NUM_FEATURES   = len(ALL_FEATURES)   # 6
 
-TRAIN_EXCHANGES = ['binance', 'kucoin', 'huobi', 'mexc', 'gateio', 'bitget']
+TRAIN_EXCHANGES = ['binance', 'kucoin', 'mexc', 'gateio', 'bitget']
 TEST_EXCHANGES  = ['bybit', 'okx']
 
-EPOCHS     = 60
-BATCH_SIZE = 64
-LR         = 1e-3
-DEVICE     = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+EPOCHS           = 60
+BATCH_SIZE       = 64
+LR               = 1e-3
+DEVICE           = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+EXCHANGE_PUMP_CAP = 5_000   # max pump windows per exchange (prevents Binance dominance)
+PEAK_REG_WEIGHT  = 0.3      # λ — weight of regression loss relative to BCE
 
 NEUTRAL_BUY_RATIO = 0.5
 NEUTRAL_AGGRESSOR = 0.0
@@ -180,28 +184,51 @@ def load_market_ctx(l2_path: str) -> np.ndarray:
         return neutral_market()
 
 
-# ── Meta / cell weight ────────────────────────────────────────────────────────
+# ── Meta loader ───────────────────────────────────────────────────────────────
 
-def load_cell_weight(l2_path: str, label: int) -> float:
+def load_meta(l2_path: str, label: int) -> tuple[float, float]:
+    """
+    Returns (cell_weight, peak_pos) for a given L2 file.
+
+    peak_pos = peak_idx / TIMESTEPS — the normalised peak location in [0, 1].
+    Sourced from meta.json fields (in priority order):
+      1. peak_pct   — written by tag_peak_buckets.py (float 0-1)
+      2. peak_idx   — written by generate_direct_synthetic.py (int)
+      3. peak_bucket — written by tag_peak_buckets.py (int 0-5, mapped to bucket centre)
+    Falls back to 0.5 (midpoint) if none present.
+    """
     meta_path = re.sub(r'(_direct_L2|_synthetic_L2|_L2)\.csv$',
                        '_meta.json', l2_path)
     coin_regime   = "pump" if label == 1 else "control"
     market_regime = "normal"
     bg_volatility = "normal"
+    peak_pos      = 0.5   # neutral default — masked out for control samples anyway
+
     if os.path.exists(meta_path):
         try:
             with open(meta_path) as f:
                 meta = json.load(f)
-            coin_regime   = meta.get("coin_regime",          coin_regime)
-            market_regime = meta.get("market_regime",        "normal")
+            coin_regime   = meta.get("coin_regime",           coin_regime)
+            market_regime = meta.get("market_regime",         "normal")
             bg_volatility = meta.get("background_volatility", "normal")
             if market_regime == "unknown":
                 market_regime = "normal"
             if bg_volatility == "unknown":
                 bg_volatility = "normal"
+
+            if "peak_pct" in meta:
+                peak_pos = float(meta["peak_pct"])
+            elif "peak_idx" in meta:
+                peak_pos = float(meta["peak_idx"]) / TIMESTEPS
+            elif "peak_bucket" in meta:
+                # Bucket centres: 0→0.08, 1→0.25, 2→0.42, 3→0.58, 4→0.75, 5→0.92
+                bucket = int(meta["peak_bucket"])
+                peak_pos = (bucket * 2 + 1) / 12.0
         except Exception:
             pass
-    return CELL_WEIGHTS.get((coin_regime, market_regime, bg_volatility), 1.5)
+
+    cell_weight = CELL_WEIGHTS.get((coin_regime, market_regime, bg_volatility), 1.5)
+    return cell_weight, peak_pos
 
 
 # ── Window extraction ─────────────────────────────────────────────────────────
@@ -209,8 +236,9 @@ def load_cell_weight(l2_path: str, label: int) -> float:
 def extract_windows(l2_df: pd.DataFrame, l2_path: str,
                     label: int, step_ratio: float = 0.5):
     """
-    Returns lists of (coin_window, market_window, cell_weight) tuples.
+    Returns lists of (coin_window, market_window, cell_weight, peak_pos).
     Each window is [TIMESTEPS, 6] float32, already normalised.
+    peak_pos is the same for all windows of a given file (event-level label).
     """
     l2_data = l2_df[L2_FEATURES].values.astype(np.float32)
     n_rows  = len(l2_data)
@@ -226,54 +254,53 @@ def extract_windows(l2_df: pd.DataFrame, l2_path: str,
 
     coin_full   = np.concatenate([l2_data, trade_data], axis=1)  # [N, 6]
     market_full = load_market_ctx(l2_path)                        # [96, 6]
-    cell_weight = load_cell_weight(l2_path, label)
+    cell_weight, peak_pos = load_meta(l2_path, label)
 
     step = max(1, int(TIMESTEPS * step_ratio))
-    coin_windows, market_windows, weights = [], [], []
+    coin_windows, market_windows, weights, peak_positions = [], [], [], []
 
     for start in range(0, n_rows - TIMESTEPS + 1, step):
         w_coin = coin_full[start:start + TIMESTEPS]
         if len(w_coin) != TIMESTEPS or not np.isfinite(w_coin).all():
             continue
-        # Market context is always a fixed 96-step sequence (one per event file).
-        # It represents the whole window's market regime — never offset-slice it.
-        # Pad with neutral fill if the file was short (edge case).
         if len(market_full) >= TIMESTEPS:
             w_mkt = market_full[:TIMESTEPS]
         else:
             pad = np.zeros((TIMESTEPS - len(market_full), market_full.shape[1]), dtype=np.float32)
-            pad[:, 0] = 1.0   # bid_price neutral
-            pad[:, 1] = 1.0   # ask_price neutral
+            pad[:, 0] = 1.0
+            pad[:, 1] = 1.0
             pad[:, 4] = NEUTRAL_BUY_RATIO
             w_mkt = np.concatenate([market_full, pad], axis=0)
 
         coin_windows.append(normalize_window(w_coin))
         market_windows.append(normalize_window(w_mkt))
         weights.append(cell_weight)
+        peak_positions.append(peak_pos)
 
-    return coin_windows, market_windows, weights
+    return coin_windows, market_windows, weights, peak_positions
 
 
 # ── Dataset class ─────────────────────────────────────────────────────────────
 
 class PumpDataset(Dataset):
-    def __init__(self, X_coin, X_market, y, sample_weights):
-        self.X_coin   = torch.FloatTensor(X_coin)
-        self.X_market = torch.FloatTensor(X_market)
-        self.y        = torch.FloatTensor(y)
-        self.weights  = sample_weights  # numpy array
+    def __init__(self, X_coin, X_market, y, peak_pos, sample_weights):
+        self.X_coin    = torch.FloatTensor(X_coin)
+        self.X_market  = torch.FloatTensor(X_market)
+        self.y         = torch.FloatTensor(y)
+        self.peak_pos  = torch.FloatTensor(peak_pos)
+        self.weights   = sample_weights   # numpy array
 
     def __len__(self):
         return len(self.y)
 
     def __getitem__(self, idx):
-        return self.X_coin[idx], self.X_market[idx], self.y[idx]
+        return self.X_coin[idx], self.X_market[idx], self.y[idx], self.peak_pos[idx]
 
 
 # ── Dataset loading ───────────────────────────────────────────────────────────
 
 def load_dataset(exchanges: list):
-    X_coin_all, X_mkt_all, y_all, w_all = [], [], [], []
+    X_coin_all, X_mkt_all, y_all, peak_all, w_all = [], [], [], [], []
 
     for exchange in exchanges:
         search_bases = [
@@ -290,6 +317,10 @@ def load_dataset(exchanges: list):
             print(f"  [SKIP] {exchange} — not found in reconstructed/ or synthetic/")
             continue
 
+        # Collect pump and control windows separately for per-exchange capping
+        exc_pump_coin, exc_pump_mkt, exc_pump_peak, exc_pump_w = [], [], [], []
+        exc_ctrl_coin, exc_ctrl_mkt, exc_ctrl_peak, exc_ctrl_w = [], [], [], []
+
         for regime_dir in sorted(all_regime_dirs):
             label = 1 if regime_dir == "pumps" else 0
             csv_files = []
@@ -299,7 +330,6 @@ def load_dataset(exchanges: list):
                     csv_files.extend(glob.glob(
                         os.path.join(rp, "**", "*_L2.csv"), recursive=True
                     ))
-            # Exclude market context files
             csv_files = [p for p in csv_files if "_market_ctx" not in p]
 
             n_windows = 0
@@ -310,11 +340,17 @@ def load_dataset(exchanges: list):
                     if missing or len(df) < TIMESTEPS:
                         continue
                     df = df.dropna(subset=L2_FEATURES)
-                    coin_w, mkt_w, wts = extract_windows(df, fpath, label)
-                    X_coin_all.extend(coin_w)
-                    X_mkt_all.extend(mkt_w)
-                    y_all.extend([label] * len(coin_w))
-                    w_all.extend(wts)
+                    coin_w, mkt_w, wts, peaks = extract_windows(df, fpath, label)
+                    if label == 1:
+                        exc_pump_coin.extend(coin_w)
+                        exc_pump_mkt.extend(mkt_w)
+                        exc_pump_w.extend(wts)
+                        exc_pump_peak.extend(peaks)
+                    else:
+                        exc_ctrl_coin.extend(coin_w)
+                        exc_ctrl_mkt.extend(mkt_w)
+                        exc_ctrl_w.extend(wts)
+                        exc_ctrl_peak.extend(peaks)
                     n_windows += len(coin_w)
                 except Exception as e:
                     print(f"  [WARN] {fpath}: {e}")
@@ -323,13 +359,30 @@ def load_dataset(exchanges: list):
                 print(f"  {exchange}/{regime_dir}: {len(csv_files)} files → "
                       f"{n_windows} windows  (label={label})")
 
+        # Apply per-exchange pump cap
+        n_pump = len(exc_pump_coin)
+        if n_pump > EXCHANGE_PUMP_CAP:
+            idx = np.random.choice(n_pump, EXCHANGE_PUMP_CAP, replace=False)
+            exc_pump_coin = [exc_pump_coin[i] for i in idx]
+            exc_pump_mkt  = [exc_pump_mkt[i]  for i in idx]
+            exc_pump_w    = [exc_pump_w[i]    for i in idx]
+            exc_pump_peak = [exc_pump_peak[i] for i in idx]
+            print(f"  {exchange}: pump windows capped {n_pump} → {EXCHANGE_PUMP_CAP}")
+
+        X_coin_all.extend(exc_pump_coin);  X_coin_all.extend(exc_ctrl_coin)
+        X_mkt_all.extend(exc_pump_mkt);   X_mkt_all.extend(exc_ctrl_mkt)
+        y_all.extend([1] * len(exc_pump_coin)); y_all.extend([0] * len(exc_ctrl_coin))
+        peak_all.extend(exc_pump_peak);    peak_all.extend(exc_ctrl_peak)
+        w_all.extend(exc_pump_w);          w_all.extend(exc_ctrl_w)
+
     if not X_coin_all:
         empty = np.empty((0, TIMESTEPS, NUM_FEATURES), dtype=np.float32)
-        return empty, empty, np.empty(0, dtype=np.float32), np.empty(0)
+        return empty, empty, np.empty(0, dtype=np.float32), np.empty(0, dtype=np.float32), np.empty(0)
 
     return (np.array(X_coin_all,  dtype=np.float32),
             np.array(X_mkt_all,   dtype=np.float32),
             np.array(y_all,       dtype=np.float32),
+            np.array(peak_all,    dtype=np.float32),
             np.array(w_all,       dtype=np.float32))
 
 
@@ -338,7 +391,6 @@ def load_dataset(exchanges: list):
 def make_loader(dataset: PumpDataset, batch_size: int,
                 shuffle: bool = True) -> DataLoader:
     if shuffle:
-        # Combine class-balance weight with 9-cell regime weight
         y        = dataset.y.numpy().astype(int)
         counts   = np.bincount(y, minlength=2).clip(min=1)
         cls_w    = (1.0 / counts)[y]
@@ -357,10 +409,12 @@ def train():
     print(f"  Train exchanges     : {TRAIN_EXCHANGES}")
     print(f"  Test  exchanges     : {TEST_EXCHANGES}  (zero-shot)")
     print(f"  Device              : {DEVICE}")
+    print(f"  Pump window cap     : {EXCHANGE_PUMP_CAP} per exchange")
+    print(f"  Peak reg. weight λ  : {PEAK_REG_WEIGHT}")
     print("=" * 65)
 
     print("\nLoading training data...")
-    X_coin_tr, X_mkt_tr, y_tr, w_tr = load_dataset(TRAIN_EXCHANGES)
+    X_coin_tr, X_mkt_tr, y_tr, peak_tr, w_tr = load_dataset(TRAIN_EXCHANGES)
     if len(X_coin_tr) == 0:
         print("\nERROR: No training data found.")
         print("Run scripts/reconstruct_orderbook.py first.")
@@ -372,7 +426,7 @@ def train():
     print(f"  Market ctx   : {'_market_ctx.csv found for some files' if X_mkt_tr.mean() != 1.0 else 'neutral fill (run fetch_market_context.py)'}")
 
     print("\nLoading zero-shot test data...")
-    X_coin_te, X_mkt_te, y_te, w_te = load_dataset(TEST_EXCHANGES)
+    X_coin_te, X_mkt_te, y_te, peak_te, w_te = load_dataset(TEST_EXCHANGES)
     if len(X_coin_te):
         print(f"  Test  total  : {len(X_coin_te)} windows  "
               f"({int(y_te.sum())} pump, {int((y_te==0).sum())} control)")
@@ -383,9 +437,9 @@ def train():
     tr_idx, val_idx = idx[:split], idx[split:]
 
     train_ds = PumpDataset(X_coin_tr[tr_idx],  X_mkt_tr[tr_idx],
-                           y_tr[tr_idx],        w_tr[tr_idx])
+                           y_tr[tr_idx],        peak_tr[tr_idx],  w_tr[tr_idx])
     val_ds   = PumpDataset(X_coin_tr[val_idx], X_mkt_tr[val_idx],
-                           y_tr[val_idx],       w_tr[val_idx])
+                           y_tr[val_idx],       peak_tr[val_idx], w_tr[val_idx])
 
     train_loader = make_loader(train_ds, BATCH_SIZE, shuffle=True)
     val_loader   = make_loader(val_ds,   BATCH_SIZE, shuffle=False)
@@ -395,45 +449,71 @@ def train():
     optimizer = optim.Adam(model.parameters(), lr=LR, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='max', patience=6, factor=0.5)
-    criterion = nn.BCELoss()
+    bce_loss_fn = nn.BCELoss()
+    mse_loss_fn = nn.MSELoss()
 
     best_val_auc = 0.0
-    print(f"\n{'Epoch':>6}  {'Train Loss':>12}  {'Val AUC':>9}")
-    print("-" * 34)
+    auc_history: list[float] = []
+    print(f"\n{'Epoch':>6}  {'Train Loss':>12}  {'BCE':>8}  {'MSE':>8}  {'Val AUC':>9}")
+    print("-" * 52)
 
     for epoch in range(1, EPOCHS + 1):
         model.train()
-        total_loss = 0.0
-        for x_coin, x_mkt, yb in train_loader:
-            x_coin, x_mkt, yb = x_coin.to(DEVICE), x_mkt.to(DEVICE), yb.to(DEVICE)
+        total_loss = total_bce = total_mse = 0.0
+
+        for x_coin, x_mkt, yb, peak_pos in train_loader:
+            x_coin   = x_coin.to(DEVICE)
+            x_mkt    = x_mkt.to(DEVICE)
+            yb       = yb.to(DEVICE)
+            peak_pos = peak_pos.to(DEVICE)
+
             optimizer.zero_grad()
-            loss = criterion(model(x_coin, x_mkt), yb)
+            pump_prob, peak_pred = model(x_coin, x_mkt)
+
+            bce = bce_loss_fn(pump_prob, yb)
+
+            # Regression loss only on pump samples where peak_idx is meaningful
+            pump_mask = yb > 0.5
+            if pump_mask.any():
+                mse = mse_loss_fn(peak_pred[pump_mask], peak_pos[pump_mask])
+            else:
+                mse = torch.tensor(0.0, device=DEVICE)
+
+            loss = bce + PEAK_REG_WEIGHT * mse
             loss.backward()
             optimizer.step()
+
             total_loss += loss.item()
+            total_bce  += bce.item()
+            total_mse  += mse.item()
 
         model.eval()
         preds, labels = [], []
         with torch.no_grad():
-            for x_coin, x_mkt, yb in val_loader:
-                preds.extend(model(x_coin.to(DEVICE),
-                                   x_mkt.to(DEVICE)).cpu().numpy())
+            for x_coin, x_mkt, yb, _ in val_loader:
+                pump_prob, _ = model(x_coin.to(DEVICE), x_mkt.to(DEVICE))
+                preds.extend(pump_prob.cpu().numpy())
                 labels.extend(yb.numpy())
 
         val_auc = roc_auc_score(labels, preds)
+        auc_history.append(val_auc)
         scheduler.step(val_auc)
 
-        avg_loss = total_loss / len(train_loader)
+        n = len(train_loader)
         if epoch % 5 == 0 or epoch == 1:
-            print(f"{epoch:>6}  {avg_loss:>12.4f}  {val_auc:>9.4f}")
+            print(f"{epoch:>6}  {total_loss/n:>12.4f}  "
+                  f"{total_bce/n:>8.4f}  {total_mse/n:>8.4f}  {val_auc:>9.4f}")
 
         if val_auc > best_val_auc:
             best_val_auc = val_auc
             os.makedirs(os.path.dirname(MODEL_SAVE_PATH), exist_ok=True)
             torch.save(model.state_dict(), MODEL_SAVE_PATH)
 
-    print("-" * 34)
+    mean_val_auc = float(np.mean(auc_history))
+    std_val_auc  = float(np.std(auc_history))
+    print("-" * 52)
     print(f"  Best validation AUC : {best_val_auc:.4f}")
+    print(f"  Mean validation AUC : {mean_val_auc:.4f}  (±{std_val_auc:.4f} across {EPOCHS} epochs)")
     print(f"  Model saved to      : {MODEL_SAVE_PATH}")
 
     # ── Zero-shot transfer test ───────────────────────────────────────────────
@@ -445,28 +525,46 @@ def train():
     print("  Zero-Shot Transfer Test  (Bybit + OKX — never seen during training)")
     print("=" * 65)
 
-    model.load_state_dict(torch.load(MODEL_SAVE_PATH, map_location=DEVICE))
+    model.load_state_dict(torch.load(MODEL_SAVE_PATH, map_location=DEVICE,
+                                     weights_only=True))
     model.eval()
 
-    test_ds     = PumpDataset(X_coin_te, X_mkt_te, y_te, w_te)
+    test_ds     = PumpDataset(X_coin_te, X_mkt_te, y_te, peak_te, w_te)
     test_loader = make_loader(test_ds, BATCH_SIZE, shuffle=False)
-    preds, labels = [], []
-    with torch.no_grad():
-        for x_coin, x_mkt, yb in test_loader:
-            preds.extend(model(x_coin.to(DEVICE),
-                               x_mkt.to(DEVICE)).cpu().numpy())
-            labels.extend(yb.numpy())
+    preds, labels, peak_preds, peak_true = [], [], [], []
 
-    preds    = np.array(preds)
-    labels   = np.array(labels)
+    with torch.no_grad():
+        for x_coin, x_mkt, yb, peak_pos in test_loader:
+            pump_prob, peak_pred = model(x_coin.to(DEVICE), x_mkt.to(DEVICE))
+            preds.extend(pump_prob.cpu().numpy())
+            labels.extend(yb.numpy())
+            peak_preds.extend(peak_pred.cpu().numpy())
+            peak_true.extend(peak_pos.numpy())
+
+    preds      = np.array(preds)
+    labels     = np.array(labels)
+    peak_preds = np.array(peak_preds)
+    peak_true  = np.array(peak_true)
+
     test_auc = roc_auc_score(labels, preds)
     bin_pred = (preds >= 0.5).astype(int)
 
-    print(f"\n  Zero-shot AUC : {test_auc:.4f}")
+    # Peak regression MAE — on pump samples only
+    pump_mask = labels > 0.5
+    if pump_mask.any():
+        peak_mae = np.abs(peak_preds[pump_mask] - peak_true[pump_mask]).mean()
+        peak_mae_candles = peak_mae * TIMESTEPS
+    else:
+        peak_mae_candles = float("nan")
+
+    print(f"\n  Zero-shot AUC       : {test_auc:.4f}")
+    print(f"  Peak reg MAE        : {peak_mae_candles:.1f} candles (pump samples)")
     print()
     print(classification_report(labels, bin_pred,
                                 target_names=["control", "pump"],
                                 zero_division=0))
+    print(f"  Hint: run scripts/calibrate_threshold.py to find the optimal")
+    print(f"  operating threshold using precision-recall curves on this test set.")
 
     if test_auc >= 0.80:
         print("  RESULT: Strong cross-exchange generalisation.")
