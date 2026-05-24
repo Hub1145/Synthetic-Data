@@ -180,13 +180,23 @@ class LiveCascade:
 
     # ── CNN inference ──────────────────────────────────────────────────────────
 
-    def _run_cnn(self, coin_buf: np.ndarray, mkt_buf: np.ndarray) -> float:
+    def _run_cnn(self, coin_buf: np.ndarray, mkt_buf: np.ndarray) -> tuple[float, int]:
+        """
+        Returns (pump_prob, peak_idx).
+
+        pump_prob  — classification head output in [0, 1]
+        peak_idx   — regression head output converted to candle index in [0, 95]
+        """
         coin_norm = _normalize_window(coin_buf)
         mkt_norm = _normalize_window(mkt_buf)
         x_coin = torch.FloatTensor(coin_norm).unsqueeze(0)   # [1, 96, 6]
         x_mkt = torch.FloatTensor(mkt_norm).unsqueeze(0)     # [1, 96, 6]
         with torch.no_grad():
-            return float(self.model(x_coin, x_mkt).item())
+            pump_prob, peak_pos = self.model(x_coin, x_mkt)
+        prob = float(pump_prob.item())
+        peak_idx = int(round(float(peak_pos.item()) * (WINDOW_SIZE - 1)))
+        peak_idx = max(0, min(WINDOW_SIZE - 1, peak_idx))
+        return prob, peak_idx
 
     # ── Per-coin scan ──────────────────────────────────────────────────────────
 
@@ -225,7 +235,7 @@ class LiveCascade:
             mkt_array[:, 1] = 1.0   # ask_price ≈ 1
             mkt_array[:, 4] = 0.5   # buy_ratio neutral
 
-        prob = self._run_cnn(coin_array, mkt_array)
+        prob, cnn_peak_idx = self._run_cnn(coin_array, mkt_array)
         if prob < CNN_THRESHOLD:
             return None
 
@@ -236,8 +246,10 @@ class LiveCascade:
         monitor.last_alert_ts = now
 
         # Stage 3: peak estimation
+        # Primary: CNN regression head (learned from synthetic data with known peak_idx)
+        # Diagnostics: heuristic detectors for cross-validation in the alert printout
         mid_prices = (coin_array[:, 0] + coin_array[:, 1]) / 2.0
-        peak_info = estimate_peak(
+        heuristic_info = estimate_peak(
             mid_prices=mid_prices,
             buy_ratios=coin_array[:, 4],
             bid_sizes=coin_array[:, 2],
@@ -245,16 +257,20 @@ class LiveCascade:
             has_trades=True,
         )
 
+        peak_idx = cnn_peak_idx
+        minutes_since_peak = (WINDOW_SIZE - 1) - peak_idx
+        phase = "peak" if minutes_since_peak <= 5 else "dump"
+
         return {
             "symbol": symbol,
             "exchange": self.exchange_id,
             "timestamp": datetime.utcnow().isoformat(timespec="seconds"),
             "pump_score": round(pump_score, 2),
             "cnn_prob": round(prob, 4),
-            "peak_idx": peak_info["peak_idx"],
-            "phase": peak_info["phase"],
-            "minutes_since_peak": peak_info["minutes_since_peak"],
-            "methods": peak_info["methods"],
+            "peak_idx": peak_idx,
+            "phase": phase,
+            "minutes_since_peak": minutes_since_peak,
+            "methods": heuristic_info["methods"],   # heuristic cross-check
         }
 
     async def _update_market_buffer(self) -> None:
