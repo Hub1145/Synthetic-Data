@@ -10,8 +10,11 @@ from pathlib import Path
 ROOT = Path(__file__).parent.parent   # go up from live/ → Synthetic Data/
 LIVE_DIR = Path(__file__).parent
 
-# PUMPABLE COINS project is a sibling of Synthetic Data/
+# PUMPABLE COINS project is a sibling of Synthetic Data/ (local dev).
+# On server deployments copy pumpable_coin_extractor.py into live/ — the fallback handles it.
 PUMPABLE_ROOT = ROOT.parent / "PUMPABLE COINS"
+if not PUMPABLE_ROOT.is_dir():
+    PUMPABLE_ROOT = LIVE_DIR  # pumpable_coin_extractor.py lives alongside cascade.py
 
 # Inject paths so models/ and PUMPABLE COINS are importable
 sys.path.insert(0, str(ROOT))           # gives access to models/pump_detector.py

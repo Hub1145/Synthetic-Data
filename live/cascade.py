@@ -10,12 +10,14 @@ Every scan tick the latest candle is pushed in. Once the buffer is full the
 three-stage cascade runs and an alert is printed to the terminal.
 """
 
+import json
 import sys
 import time
 import asyncio
 import logging
 from collections import deque
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -139,10 +141,12 @@ class LiveCascade:
         exchange_id: str,
         symbols: List[str],
         cooldown_minutes: int = 10,
+        alert_log: Optional[Path] = None,
     ):
         self.exchange_id = exchange_id
         self.symbols = symbols
         self.cooldown_seconds = cooldown_minutes * 60
+        self.alert_log = alert_log          # Path to alerts.jsonl, or None
 
         self.model = _load_model()
         self.extractor = PumpableCoinExtractor()
@@ -310,6 +314,8 @@ class LiveCascade:
 
                 for alert in alerts:
                     _print_alert(alert)
+                    if self.alert_log:
+                        _write_alert_jsonl(alert, self.alert_log)
 
                 wait = max(0.0, interval - elapsed)
                 logger.debug(f"Scan done in {elapsed:.1f}s — next in {wait:.0f}s")
@@ -318,7 +324,26 @@ class LiveCascade:
             await self.exchange.close()
 
 
-# ── Alert printer ──────────────────────────────────────────────────────────────
+# ── Alert output ───────────────────────────────────────────────────────────────
+
+def _write_alert_jsonl(alert: Dict, path: Path) -> None:
+    """Append one JSON line to the alerts log (safe: opens/closes each write)."""
+    try:
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "ts":                alert["timestamp"] + "Z",
+                "exchange":          alert["exchange"],
+                "symbol":            alert["symbol"],
+                "pumpable_score":    alert["pump_score"],
+                "cnn_prob":          alert["cnn_prob"],
+                "phase":             alert["phase"],
+                "peak_candle":       alert["peak_idx"],
+                "minutes_since_peak": alert["minutes_since_peak"],
+                "detectors":         alert.get("methods", {}),
+            }) + "\n")
+    except Exception as e:
+        logger.error(f"Failed to write alert to {path}: {e}")
+
 
 def _print_alert(alert: Dict) -> None:
     if alert["phase"] == "peak":

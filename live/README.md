@@ -73,17 +73,17 @@ They are completely independent except for the `.pth` file.
 
 ```
 live/
-├── main.py            CLI entry point — argument parsing, startup banner, asyncio.run()
-├── cascade.py         Core detection logic: CoinMonitor + LiveCascade classes
-├── peak_detector.py   Standalone peak estimation: 4 methods + consensus combiner
-├── config.py          All paths, thresholds, and settings in one place
-├── requirements.txt   Python dependencies
-└── README.md          This file
+├── main.py                      CLI entry point — argument parsing, startup banner, asyncio.run()
+├── cascade.py                   Core detection logic: CoinMonitor + LiveCascade classes
+├── peak_detector.py             Standalone peak estimation: 4 methods + consensus combiner
+├── config.py                    All paths, thresholds, and settings in one place
+├── pumpable_coin_extractor.py   Stage 1 scorer (copied here for server deployments)
+├── requirements.txt             Python dependencies
+└── README.md                    This file
 ```
 
-Also depends on two external locations (paths auto-configured in `config.py`):
+Also depends on:
 - `../models/pump_detector_v3.pth` — trained weights (produced by `scripts/train_pump_detector.py`)
-- `../../PUMPABLE COINS/pumpable_coin_extractor.py` — stage 1 scorer (sibling project)
 
 ---
 
@@ -97,13 +97,12 @@ Synthetic Data/models/pump_detector_v3.pth
 ```
 If it doesn't exist yet, run the training pipeline in `scripts/` first.
 
-**The PUMPABLE COINS project must be a sibling folder:**
-```
-WORKSPACE/
-├── Synthetic Data/    ← you are here
-└── PUMPABLE COINS/    ← must exist at this path
-```
-`config.py` auto-adds both locations to `sys.path` at startup — no manual configuration needed.
+**`pumpable_coin_extractor.py` must be accessible.** Two supported layouts:
+
+| Environment | Location | How |
+|---|---|---|
+| Local dev | `WORKSPACE/PUMPABLE COINS/pumpable_coin_extractor.py` | `config.py` finds it automatically as a sibling folder |
+| Server / container | `live/pumpable_coin_extractor.py` | Copy the file into `live/`; `config.py` falls back to `live/` if the sibling folder is missing |
 
 **No API keys required.** All exchange data is fetched from public endpoints.
 
@@ -130,22 +129,51 @@ Dependencies:
 
 ## 5. Quick Start
 
-Run everything from the `Synthetic Data/` root directory:
+Run from the `live/` directory or from the `Synthetic Data/` root:
 
 ```bash
-# Watch 3 specific coins on Binance
-python live/main.py --exchange binance --symbols ETH/USDT SOL/USDT DOGE/USDT
+# ── From inside live/ ────────────────────────────────────────────────
+cd live/
 
-# Automatically monitor the top 50 USDT pairs by 24h volume on KuCoin
-python live/main.py --exchange kucoin --top 50
+# Watch specific coins on Binance
+python main.py --exchange binance --symbols ETH/USDT SOL/USDT DOGE/USDT
 
-# Scan every 30 seconds instead of every 60
-python live/main.py --exchange bybit --top 30 --interval 30
+# Top 50 USDT pairs by 24h volume on KuCoin
+python main.py --exchange kucoin --top 50
 
-# Show debug logs (useful during the warmup period)
-python live/main.py --exchange okx --top 20 --verbose
+# Every USDT spot pair on Bybit (700+ symbols)
+python main.py --exchange bybit --all
+
+# Every USDT spot pair on Binance (1500+ symbols)
+python main.py --exchange binance --all
+
+# Scan every 30 seconds with verbose debug output
+python main.py --exchange bybit --top 30 --interval 30 --verbose
+
+# Save session log + alerts JSONL
+python main.py --exchange bybit --top 100 --log-file logs/bybit.log
+
+# Disable cooldown (every alert fires every tick — for testing only)
+python main.py --exchange okx --top 20 --cooldown 0
 
 # Stop at any time with Ctrl+C
+
+
+# ── From Synthetic Data/ root ────────────────────────────────────────
+python live/main.py --exchange binance --top 50
+python live/main.py --exchange bybit --all
+
+
+# ── Scanning multiple exchanges simultaneously ────────────────────────
+# One exchange per process — run each in its own terminal or screen session:
+python main.py --exchange binance --top 100 --log-file logs/binance.log
+python main.py --exchange bybit   --top 100 --log-file logs/bybit.log
+python main.py --exchange okx     --top 100 --log-file logs/okx.log
+
+# Or run all in background with nohup:
+nohup python main.py --exchange binance --top 100 --log-file logs/binance.log > /dev/null 2>&1 &
+nohup python main.py --exchange bybit   --top 100 --log-file logs/bybit.log   > /dev/null 2>&1 &
+nohup python main.py --exchange okx     --top 100 --log-file logs/okx.log     > /dev/null 2>&1 &
 ```
 
 On startup you will see:
@@ -173,16 +201,36 @@ python live/main.py [options]
 
 | Option | Type | Default | Description |
 |---|---|---|---|
-| `--exchange` | string | `binance` | Exchange to scan. Choices: `binance kucoin bybit okx mexc gateio bitget` |
-| `--symbols` | list | — | Specific symbols to watch (e.g. `ETH/USDT SOL/USDT`). Use this OR `--top`, not both |
-| `--top N` | int | — | Auto-fetch the top N USDT pairs by 24h volume from the exchange |
+| `--exchange` | string | `binance` | Exchange to scan. **One exchange per process.** Choices: `binance kucoin bybit okx mexc gateio bitget` |
+| `--symbols` | list | — | Specific symbols to watch (e.g. `ETH/USDT SOL/USDT`). Mutually exclusive with `--top` / `--all` |
+| `--top N` | int | — | Auto-fetch the top N USDT spot pairs by 24h volume |
+| `--all` | flag | off | Monitor every USDT spot pair on the exchange (500–1500+ symbols depending on exchange) |
 | `--interval` | int | `60` | Seconds between scan ticks |
-| `--cooldown` | int | `10` | Minutes to suppress repeat alerts for the same coin after one fires |
-| `--verbose` | flag | off | Enable DEBUG-level logging (shows per-coin scan results, fetch errors) |
+| `--cooldown` | int | `10` | Minutes to suppress repeat alerts for the same coin after one fires. Use `0` to disable |
+| `--log-file` | path | — | Write full session log to PATH and structured alerts to PATH with `_alerts.jsonl` suffix |
+| `--verbose` | flag | off | Enable DEBUG-level logging (shows per-coin scan results, fetch errors, warmup progress) |
 
-**`--symbols` vs `--top`:**
-- `--symbols` is best when you already know which coins to watch (faster startup, no ticker fetch needed)
-- `--top N` fetches all tickers from the exchange, ranks by volume, and picks the top N — good for broad market scanning
+> **One exchange per process.** To scan multiple exchanges at the same time, launch one `main.py` process per exchange (each with its own `--log-file`). See the multi-exchange examples in Quick Start above.
+
+**Choosing a symbol selection mode:**
+
+| Mode | Command | Best for |
+|---|---|---|
+| Specific coins | `--symbols ETH/USDT SOL/USDT` | You already know which coins to watch; fastest startup |
+| Top N by volume | `--top 50` | Broad coverage of the most liquid markets |
+| Everything | `--all` | Full market sweep; high memory + rate-limit usage — use a longer `--interval` (120s+) |
+
+**`--all` symbol counts by exchange (approximate):**
+
+| Exchange | USDT spot pairs |
+|---|---|
+| Binance | ~1,500 |
+| KuCoin | ~800 |
+| Bybit | ~700 |
+| OKX | ~600 |
+| Gate.io | ~2,000+ |
+| MEXC | ~2,000+ |
+| Bitget | ~700 |
 
 ---
 
