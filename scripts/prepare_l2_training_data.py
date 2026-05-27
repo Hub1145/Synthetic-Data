@@ -14,27 +14,53 @@ FEATURES = ['bid_price', 'ask_price', 'bid_size', 'ask_size']
 
 def prepare_data():
     print(f"Scanning {INPUT_BASE} for reconstructed L2 files...")
-    files = glob.glob(os.path.join(INPUT_BASE, "**/*_L2.csv"), recursive=True)
+    files = [p for p in glob.glob(os.path.join(INPUT_BASE, "**/*_L2.csv"), recursive=True)
+             if "_market_ctx" not in p]
     print(f"Found {len(files)} files.")
-    
+
     all_samples = []
-    
+    skipped_nan = 0
+    skipped_mid = 0
+
     for f in files:
         try:
             df = pd.read_csv(f)
             if len(df) < TIMESTEPS:
                 continue
-            
-            # Take the first TIMESTEPS
-            data = df[FEATURES].values[:TIMESTEPS]
-            
-            # Normalize prices relative to the first mid-price in the window
-            mid0 = (data[0, 0] + data[0, 1]) / 2
+
+            # Take the first TIMESTEPS rows
+            data = df[FEATURES].values[:TIMESTEPS].astype(np.float64)
+
+            # Drop samples that already contain NaN/Inf before normalisation
+            if not np.isfinite(data).all():
+                skipped_nan += 1
+                continue
+
+            # Normalise prices relative to first mid-price
+            mid0 = (data[0, 0] + data[0, 1]) / 2.0
+            if mid0 <= 0:
+                skipped_mid += 1
+                continue
             data[:, 0:2] /= mid0
-            
-            all_samples.append(data)
+
+            # Drop samples that became NaN/Inf during normalisation
+            if not np.isfinite(data).all():
+                skipped_nan += 1
+                continue
+
+            # Drop samples with non-positive sizes (guard against corrupt data)
+            mean_sz = data[:, 2:4].mean()
+            if mean_sz <= 0:
+                skipped_nan += 1
+                continue
+            data[:, 2:4] /= mean_sz
+
+            all_samples.append(data.astype(np.float32))
         except Exception as e:
             print(f"Error processing {f}: {e}")
+
+    print(f"  Skipped (mid0 ≤ 0)  : {skipped_mid}")
+    print(f"  Skipped (NaN/Inf)   : {skipped_nan}")
             
     if not all_samples:
         print("No valid samples found.")

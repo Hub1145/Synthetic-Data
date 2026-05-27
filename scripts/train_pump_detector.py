@@ -191,11 +191,14 @@ def load_meta(l2_path: str, label: int) -> tuple[float, float]:
     Returns (cell_weight, peak_pos) for a given L2 file.
 
     peak_pos = peak_idx / TIMESTEPS — the normalised peak location in [0, 1].
-    Sourced from meta.json fields (in priority order):
-      1. peak_pct   — written by tag_peak_buckets.py (float 0-1)
-      2. peak_idx   — written by generate_direct_synthetic.py (int)
-      3. peak_bucket — written by tag_peak_buckets.py (int 0-5, mapped to bucket centre)
-    Falls back to 0.5 (midpoint) if none present.
+    Sourced from meta.json fields (checked in order, first valid wins):
+      1. peak_idx  — used ONLY if 0 ≤ peak_idx < TIMESTEPS (synthetic files store the
+                     within-window candle index 0–95; reconstructed files store the raw
+                     file-row index e.g. 3854 — those are skipped here)
+      2. peak_pct  — only if it is a temporal fraction in (0, 1]; values > 1 are price
+                     spike percentages from tag_peak_buckets.py and are ignored
+      3. peak_bucket — micro/small/medium/large/major/extreme mapped to bucket centre
+    Falls back to 0.5 (midpoint) if nothing is usable.
     """
     meta_path = re.sub(r'(_direct_L2|_synthetic_L2|_L2)\.csv$',
                        '_meta.json', l2_path)
@@ -216,13 +219,29 @@ def load_meta(l2_path: str, label: int) -> tuple[float, float]:
             if bg_volatility == "unknown":
                 bg_volatility = "normal"
 
-            if "peak_pct" in meta:
-                peak_pos = float(meta["peak_pct"])
-            elif "peak_idx" in meta:
-                peak_pos = float(meta["peak_idx"]) / TIMESTEPS
-            elif "peak_bucket" in meta:
-                # Bucket centres: 0→0.08, 1→0.25, 2→0.42, 3→0.58, 4→0.75, 5→0.92
-                bucket = int(meta["peak_bucket"])
+            if "peak_idx" in meta and meta.get("peak_idx") is not None:
+                raw_idx = float(meta["peak_idx"])
+                if 0 <= raw_idx < TIMESTEPS:
+                    # Synthetic files: peak_idx is already a within-window index (0–95)
+                    peak_pos = raw_idx / TIMESTEPS
+                # else: reconstructed files store raw file row index (e.g. 3854 in a
+                # 5760-row file) — fall through to peak_bucket which is always correct
+            if peak_pos == 0.5 and "peak_pct" in meta and meta.get("peak_pct") is not None:
+                v = float(meta["peak_pct"])
+                if 0.0 < v <= 1.0:
+                    # peak_pct written as temporal fraction [0–1] by some older scripts
+                    peak_pos = v
+            if peak_pos == 0.5 and "peak_bucket" in meta and meta.get("peak_bucket") is not None:
+                # Bucket centres: micro→0.08, small→0.25, medium→0.42,
+                #                 large→0.58, major→0.75, extreme→0.92
+                bucket_names = ["micro", "small", "medium", "large", "major", "extreme"]
+                bval = meta["peak_bucket"]
+                if isinstance(bval, int):
+                    bucket = bval
+                elif isinstance(bval, str) and bval in bucket_names:
+                    bucket = bucket_names.index(bval)
+                else:
+                    bucket = 2   # default to middle bucket
                 peak_pos = (bucket * 2 + 1) / 12.0
         except Exception:
             pass
